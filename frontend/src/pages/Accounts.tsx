@@ -219,6 +219,8 @@ function RegisterModal({
   // 后续点"打开支付链接"直接复用）。仅当 platform === 'chatgpt' 时显示开关。
   const [autoPaymentLink, setAutoPaymentLink] = useState(false)
   const [chatgptWorkspaceIds, setChatgptWorkspaceIds] = useState(DEFAULT_CHATGPT_WORKSPACE_IDS)
+  const [chatgptUseProxyPool, setChatgptUseProxyPool] = useState(true)
+  const [chatgptProxy, setChatgptProxy] = useState('')
   // GoPay 专属：PIN（6 位数字）、Hero-SMS API key、注册代理。仅当
   // platform === 'gopay' 时显示，未填时后端走环境变量回退。
   const [gopayPin, setGopayPin] = useState('147258')
@@ -235,6 +237,7 @@ function RegisterModal({
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
   const [starting, setStarting] = useState(false)
+  const [startError, setStartError] = useState('')
 
   const supportedExecutors: string[] = platformMeta?.supported_executors || []
   const registrationOptions = buildRegistrationOptions(platformMeta, language)
@@ -350,8 +353,14 @@ function RegisterModal({
 
   const start = async () => {
     setStarting(true)
+    setStartError('')
     try {
       const cfg = config || {}
+      const trimmedChatgptWorkspaceIds = chatgptWorkspaceIds.trim()
+      const trimmedChatgptProxy = chatgptProxy.trim()
+      if (platform === 'chatgpt' && trimmedChatgptWorkspaceIds && selection.identityProvider !== 'mailbox') {
+        throw new Error('Workspace Join 需要选择系统邮箱 / 邮箱注册，Microsoft OAuth 不会读取本地微软邮箱池。')
+      }
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
         oauth_provider: selection.oauthProvider,
@@ -364,6 +373,9 @@ function RegisterModal({
           throw new Error(t('accounts.missingDefaultMailbox'))
         }
         extra.mail_provider = defaultMailboxProvider.provider_key
+      }
+      if (platform === 'chatgpt') {
+        extra.registration_use_proxy_pool = Boolean(chatgptUseProxyPool && !trimmedChatgptProxy)
       }
       // GoPay 专属：手机号接码注册需要 PIN / API key / 代理
       if (platform === 'gopay') {
@@ -397,11 +409,11 @@ function RegisterModal({
           checkout_mode: 'protocol',
         }
       }
-      if (platform === 'chatgpt' && chatgptWorkspaceIds.trim()) {
+      if (platform === 'chatgpt' && trimmedChatgptWorkspaceIds) {
         extra.auto_chatgpt_workspace_join = true
         extra.chatgpt_workspace_join = {
           enabled: true,
-          workspace_ids: chatgptWorkspaceIds.trim(),
+          workspace_ids: trimmedChatgptWorkspaceIds,
           route: 'request',
           accept_invite: true,
           export_cpa_json: true,
@@ -409,7 +421,7 @@ function RegisterModal({
         }
       }
       const effectiveExecutorType =
-        platform === 'chatgpt' && chatgptWorkspaceIds.trim() && selection.executorType === 'protocol'
+        platform === 'chatgpt' && trimmedChatgptWorkspaceIds && selection.executorType === 'protocol'
           ? 'headed'
           : selection.executorType
       const res = await apiFetch('/tasks/register', {
@@ -418,11 +430,13 @@ function RegisterModal({
           platform, count: regCount, concurrency,
           executor_type: effectiveExecutorType,
           captcha_solver: 'auto',
-          proxy: null,
+          proxy: platform === 'chatgpt' && trimmedChatgptProxy ? trimmedChatgptProxy : null,
           extra,
         }),
       })
       setTaskId(res.task_id)
+    } catch (error) {
+      setStartError(error instanceof Error ? error.message : String(error || '启动失败'))
     } finally { setStarting(false) }
   }
 
@@ -597,6 +611,33 @@ function RegisterModal({
                         </div>
                       </div>
                     </label>
+                    <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/40 px-3 py-3 space-y-2">
+                      <div>
+                        <label className="text-xs text-[var(--text-muted)] block mb-1">注册代理（可选，优先于代理池）</label>
+                        <input
+                          type="text"
+                          value={chatgptProxy}
+                          onChange={(e) => setChatgptProxy(e.target.value)}
+                          placeholder="http://user:pass@host:port"
+                          className="control-surface control-surface-compact w-full"
+                        />
+                      </div>
+                      <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={chatgptUseProxyPool}
+                          disabled={Boolean(chatgptProxy.trim())}
+                          onChange={(e) => setChatgptUseProxyPool(e.target.checked)}
+                          className="mt-0.5 h-4 w-4 cursor-pointer accent-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                        />
+                        <div className="text-xs text-[var(--text-muted)]">
+                          <div className="text-[var(--text-secondary)]">未填写注册代理时使用代理池</div>
+                          <div className="mt-0.5">
+                            后端会从代理资源中轮询选择可用代理；若填写了上面的代理地址，则本次注册优先使用该代理。
+                          </div>
+                        </div>
+                      </label>
+                    </div>
                     <div>
                       <label className="text-xs text-[var(--text-muted)] block mb-1">Workspace IDs</label>
                       <textarea
@@ -606,7 +647,7 @@ function RegisterModal({
                         className="control-surface control-surface-compact w-full min-h-20 font-mono text-xs"
                       />
                       <div className="mt-1 text-xs text-[var(--text-muted)]">
-                        注册完成后会在当前 ChatGPT 页面发送 Workspace Join Request，收到邀请邮件后自动打开邀请链接加入工作空间，并下载 CPA JSON 到本地。多 ID 可换行填写。
+                        注册完成后会在当前 ChatGPT 页面发送 Workspace Join Request，收到邀请邮件后自动打开邀请链接加入工作空间，并下载 CPA JSON 到本地。多 ID 可换行填写。此流程需要选择系统邮箱/邮箱注册，才能复用本地微软邮箱池收邀请邮件。
                       </div>
                     </div>
                   </div>
@@ -620,6 +661,12 @@ function RegisterModal({
                     <div className="mt-2 text-amber-400">后台浏览器自动依赖 Chrome Profile 或 Chrome CDP，未配置时只允许可视浏览器自动。</div>
                   )}
                 </div>
+
+                {startError && (
+                  <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-xs text-red-300">
+                    {startError}
+                  </div>
+                )}
 
                 <Button
                   onClick={start}

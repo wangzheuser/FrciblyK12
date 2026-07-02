@@ -861,9 +861,11 @@ def _resolve_sms_provider_for_task(extra: dict[str, Any]) -> tuple[str, dict[str
     ).strip()
     if not provider_key:
         provider_key = "sms_activate" if extra.get("sms_activate_api_key") else ""
-    definition = definitions_repo.get_by_key("sms", provider_key) if provider_key else None
-    settings = settings_repo.resolve_runtime_settings("sms", provider_key, extra) if definition else dict(extra)
-    return provider_key, settings
+    lookup_key = "herosms_api" if provider_key == "herosms" else provider_key
+    logical_key = "herosms" if lookup_key == "herosms_api" else provider_key
+    definition = definitions_repo.get_by_key("sms", lookup_key) if lookup_key else None
+    settings = settings_repo.resolve_runtime_settings("sms", lookup_key, extra) if definition else dict(extra)
+    return logical_key, settings
 
 
 def _bool_config(value: Any, default: bool) -> bool:
@@ -885,11 +887,25 @@ def _resolve_registration_proxy_for_platform(
     platform_name: str,
     *,
     explicit_proxy: str | None,
+    use_proxy_pool: bool | None = None,
     proxy_getter: Callable[[], str | None],
 ) -> str | None:
-    if str(platform_name or "").strip().lower() == "chatgpt":
+    explicit = str(explicit_proxy or "").strip()
+    if explicit:
+        return explicit
+    if use_proxy_pool is None:
+        use_proxy_pool = str(platform_name or "").strip().lower() != "chatgpt"
+    if not use_proxy_pool:
         return None
-    return explicit_proxy or proxy_getter()
+    picked = proxy_getter()
+    return str(picked or "").strip() or None
+
+
+def _registration_use_proxy_pool_for_platform(platform_name: str, extra: dict[str, Any]) -> bool:
+    value = (extra or {}).get("registration_use_proxy_pool")
+    if value not in (None, ""):
+        return _bool_config(value, False)
+    return str(platform_name or "").strip().lower() != "chatgpt"
 
 
 def _auto_followup_windsurf_payment(
@@ -1237,6 +1253,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     registration_base_proxy = _resolve_registration_proxy_for_platform(
         platform_name,
         explicit_proxy=proxy,
+        use_proxy_pool=False,
         proxy_getter=lambda: None,
     )
 
@@ -1348,6 +1365,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         resolved_proxy = _resolve_registration_proxy_for_platform(
             platform_name,
             explicit_proxy=proxy,
+            use_proxy_pool=_registration_use_proxy_pool_for_platform(platform_name, extra),
             proxy_getter=proxy_pool.get_next,
         )
         # 短链物理复用（CtfGptPlus / PayPal）：注册和打开短链必须同一浏览器。

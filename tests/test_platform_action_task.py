@@ -183,6 +183,61 @@ def test_chatgpt_register_task_fails_when_workspace_join_fails(monkeypatch):
     assert not any(event[0] == "success" for event in logger.events)
 
 
+def test_chatgpt_register_task_uses_proxy_pool_when_requested(monkeypatch):
+    captured = {}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    def fake_build_platform(*args, **kwargs):
+        captured["proxy"] = kwargs.get("resolved_proxy")
+        return FakePlatform()
+
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", fake_build_platform)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+
+    from core.proxy_pool import proxy_pool
+
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": "http://pool-proxy.example:8080")
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: captured.setdefault("success_proxy", url))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: captured.setdefault("fail_proxy", url))
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "registration_use_proxy_pool": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert captured["proxy"] == "http://pool-proxy.example:8080"
+    assert captured["success_proxy"] == "http://pool-proxy.example:8080"
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert any(
+        event[0] == "log" and "使用代理: http://pool-proxy.example:8080" in event[1]
+        for event in logger.events
+    )
+
+
 def test_phone_bind_task_passes_logger_and_browser_mode(monkeypatch):
     seen = {}
 

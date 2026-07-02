@@ -3,6 +3,12 @@ from __future__ import annotations
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
 
+def _public_provider_key(provider_type: str, provider_key: str) -> str:
+    if str(provider_type or "").strip() == "sms" and str(provider_key or "").strip() == "herosms_api":
+        return "herosms"
+    return str(provider_key or "").strip()
+
+
 class ProviderDefinitionsService:
     def __init__(self, repository: ProviderDefinitionsRepository | None = None):
         self.repository = repository or ProviderDefinitionsRepository()
@@ -35,11 +41,12 @@ class ProviderDefinitionsService:
         return self._serialize(item) if item else None
 
     def _serialize(self, item) -> dict:
+        public_key = _public_provider_key(item.provider_type, item.provider_key)
         return {
             "id": int(item.id or 0),
             "provider_type": item.provider_type,
-            "provider_key": item.provider_key,
-            "value": item.provider_key,
+            "provider_key": public_key,
+            "value": public_key,
             "label": item.label,
             "description": item.description,
             "driver_type": item.driver_type,

@@ -573,7 +573,7 @@ def _click_until_next_dom_target(
     last_summary = ""
 
     while time.monotonic() <= deadline:
-        next_probe_timeout = min(max(int((deadline - time.monotonic()) * 1000), 1), 350)
+        next_probe_timeout = min(max(int((deadline - time.monotonic()) * 1000), 1), 180)
         next_target = _wait_for_dom_target(
             page,
             next_script,
@@ -586,7 +586,7 @@ def _click_until_next_dom_target(
         if isinstance(next_target, dict):
             last_summary = str(next_target.get("summary") or next_target)[:240]
 
-        click_timeout = min(max(int((deadline - time.monotonic()) * 1000), 1), 700)
+        click_timeout = min(max(int((deadline - time.monotonic()) * 1000), 1), 300)
         click_target = _wait_for_dom_target(
             page,
             click_script,
@@ -605,7 +605,7 @@ def _click_until_next_dom_target(
             _move_mouse_to_target(page, click_target)
         _page_wait(page, post_click_wait_ms)
 
-        next_timeout = min(max(int((deadline - time.monotonic()) * 1000), 1), 900)
+        next_timeout = min(max(int((deadline - time.monotonic()) * 1000), 1), 250)
         next_target = _wait_for_dom_target(
             page,
             next_script,

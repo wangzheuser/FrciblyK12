@@ -8,8 +8,19 @@ from core.db import ProviderSettingModel, engine
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
 
+_PROVIDER_KEY_ALIASES = {
+    ("sms", "herosms"): "herosms_api",
+}
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _canonical_provider_key(provider_type: str, provider_key: str) -> str:
+    raw_type = str(provider_type or "").strip()
+    raw_key = str(provider_key or "").strip()
+    return _PROVIDER_KEY_ALIASES.get((raw_type, raw_key), raw_key)
 
 
 class ProviderSettingsRepository:
@@ -29,6 +40,7 @@ class ProviderSettingsRepository:
             return session.get(ProviderSettingModel, setting_id)
 
     def get_by_key(self, provider_type: str, provider_key: str) -> ProviderSettingModel | None:
+        provider_key = _canonical_provider_key(provider_type, provider_key)
         with Session(engine) as session:
             return session.exec(
                 select(ProviderSettingModel)
@@ -37,6 +49,7 @@ class ProviderSettingsRepository:
             ).first()
 
     def resolve_runtime_settings(self, provider_type: str, provider_key: str, overrides: dict | None = None) -> dict:
+        provider_key = _canonical_provider_key(provider_type, provider_key)
         definition = self.definitions.get_by_key(provider_type, provider_key)
         item = self.get_by_key(provider_type, provider_key)
         payload: dict = {}
@@ -120,7 +133,11 @@ class ProviderSettingsRepository:
         auth: dict,
         metadata: dict,
     ) -> ProviderSettingModel:
+        provider_key = _canonical_provider_key(provider_type, provider_key)
         definition = self.definitions.get_by_key(provider_type, provider_key)
+        if not definition:
+            self.definitions.ensure_seeded()
+            definition = self.definitions.get_by_key(provider_type, provider_key)
         if not definition:
             raise ValueError(f"未知 provider: {provider_type}/{provider_key}")
 

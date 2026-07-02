@@ -43,12 +43,40 @@ def test_resolve_sms_provider_for_task_allows_inline_override():
     assert settings["sms_country"] == "52"
 
 
-def test_chatgpt_registration_does_not_use_proxy_pool_or_explicit_proxy():
+def test_chatgpt_registration_uses_explicit_proxy_without_proxy_pool_opt_in():
     calls = []
 
     proxy = _resolve_registration_proxy_for_platform(
         "chatgpt",
         explicit_proxy="http://explicit-proxy.example:8080",
+        use_proxy_pool=False,
+        proxy_getter=lambda: calls.append("called") or "http://pool-proxy.example:8080",
+    )
+
+    assert proxy == "http://explicit-proxy.example:8080"
+    assert calls == []
+
+
+def test_chatgpt_registration_uses_proxy_pool_when_enabled():
+    calls = []
+
+    proxy = _resolve_registration_proxy_for_platform(
+        "chatgpt",
+        explicit_proxy="",
+        use_proxy_pool=True,
+        proxy_getter=lambda: calls.append("called") or "http://pool-proxy.example:8080",
+    )
+
+    assert proxy == "http://pool-proxy.example:8080"
+    assert calls == ["called"]
+
+
+def test_chatgpt_registration_skips_proxy_pool_by_default_for_compatibility():
+    calls = []
+
+    proxy = _resolve_registration_proxy_for_platform(
+        "chatgpt",
+        explicit_proxy="",
         proxy_getter=lambda: calls.append("called") or "http://pool-proxy.example:8080",
     )
 
