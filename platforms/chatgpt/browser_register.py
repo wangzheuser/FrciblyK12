@@ -1607,6 +1607,41 @@ def _derive_registration_state_from_page(page) -> dict:
     return state
 
 
+def _wait_for_recognized_registration_state(page, log, timeout: float = 8.0) -> dict:
+    """Wait briefly for auth pages that are between redirects.
+
+    The OpenAI auth flow sometimes returns HTTP 200 from an OTP/password submit
+    while the browser is still on an intermediate blank/resume page that has no
+    recognizable URL or form controls yet.  Treating that moment as a hard
+    ``page=-`` state makes otherwise valid sessions fail before the final
+    ChatGPT session probe can run.
+    """
+
+    deadline = time.time() + max(float(timeout or 0), 0.5)
+    last_state: dict = {}
+    last_url = ""
+    while time.time() < deadline:
+        try:
+            state = _derive_registration_state_from_page(page)
+        except Exception:
+            state = {}
+        if state.get("page_type"):
+            if last_url and last_url != str(state.get("current_url") or ""):
+                log(
+                    "注册状态恢复: "
+                    f"page={state.get('page_type')} url={str(state.get('current_url') or '')[:100]}"
+                )
+            return state
+        last_state = state if isinstance(state, dict) else {}
+        last_url = str(last_state.get("current_url") or getattr(page, "url", "") or "")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=600)
+        except Exception:
+            pass
+        time.sleep(0.35)
+    return last_state
+
+
 def _recover_signup_password_page(page, log) -> bool:
     if not _is_login_password_url(str(page.url or "")):
         return False
@@ -1980,9 +2015,9 @@ def _infer_page_type(data: dict | None, current_url: str = "") -> str:
         return "login_password"
     if "sign-in-with-chatgpt" in url and "consent" in url:
         return "consent"
-    if "workspace" in url and "select" in url:
+    if "workspace" in url:
         return "workspace_selection"
-    if "organization" in url and "select" in url:
+    if "organization" in url:
         return "organization_selection"
     if "add-phone" in url:
         return "add_phone"
@@ -3262,6 +3297,81 @@ def _requires_registration_navigation(state: dict) -> bool:
     continue_url = str(state.get("continue_url") or "")
     current_url = str(state.get("current_url") or "")
     return bool(continue_url and continue_url != current_url)
+
+
+def _continue_auth_workspace_or_consent_page(page, log) -> bool:
+    """Click through OpenAI auth workspace/organization/consent interstitials."""
+
+    selectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button[data-testid="continue-button"]',
+        'button:has-text("Continue")',
+        'button:has-text("继续")',
+        'button:has-text("下一步")',
+        'button:has-text("Next")',
+        'button:has-text("Select")',
+        'button:has-text("选择")',
+        'button:has-text("Personal")',
+        'button:has-text("个人")',
+        'button:has-text("ChatGPT")',
+        'a:has-text("Continue")',
+        'a:has-text("继续")',
+        '[role="button"]:has-text("Continue")',
+        '[role="button"]:has-text("继续")',
+    ]
+    selector = _click_first(page, selectors, timeout=6)
+    if selector:
+        log(f"auth workspace/consent 已点击继续按钮: {selector}")
+        return True
+
+    try:
+        result = page.evaluate(
+            """
+            () => {
+              const textOf = (el) => String(
+                el && (el.innerText || el.textContent || el.getAttribute("aria-label") || el.value) || ""
+              ).replace(/\\s+/g, " ").trim();
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== "none" && style.visibility !== "hidden" &&
+                  rect.width > 0 && rect.height > 0;
+              };
+              const enabled = (el) => !el.disabled && el.getAttribute("aria-disabled") !== "true";
+              const pattern = /Continue|继续|下一步|Next|Select|选择|Personal|个人|ChatGPT|Confirm|确认|Start|开始/i;
+              const nodes = Array.from(document.querySelectorAll(
+                "button, input[type='submit'], a, [role='button'], [role='menuitem'], [role='menuitemradio']"
+              ));
+              const candidates = nodes.filter((el) => visible(el) && enabled(el)).map(textOf).filter(Boolean).slice(0, 12);
+              const target = nodes.find((el) => visible(el) && enabled(el) && pattern.test(textOf(el))) ||
+                nodes.find((el) => visible(el) && enabled(el) && ["BUTTON", "A"].includes(el.tagName));
+              if (target) {
+                const text = textOf(target);
+                try { target.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {}
+                target.click();
+                return { clicked: true, text, candidates };
+              }
+              const form = Array.from(document.querySelectorAll("form")).find(visible);
+              if (form && typeof form.requestSubmit === "function") {
+                form.requestSubmit();
+                return { clicked: true, text: "form.requestSubmit", candidates };
+              }
+              return { clicked: false, text: "", candidates };
+            }
+            """
+        )
+    except Exception as exc:
+        log(f"auth workspace/consent 点击探测异常: {str(exc)[:160]}")
+        return False
+
+    if isinstance(result, dict) and result.get("clicked"):
+        log(f"auth workspace/consent 已使用 DOM fallback: {result.get('text') or '-'}")
+        return True
+    if isinstance(result, dict) and result.get("candidates"):
+        log(f"auth workspace/consent 可见按钮候选: {result.get('candidates')}")
+    return False
 
 
 def _browser_add_cookies(page, cookies: list[dict]) -> None:
@@ -4837,6 +4947,20 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             )
             continue
 
+        if str(state.get("page_type") or "") in {"consent", "workspace_selection", "organization_selection"}:
+            log(f"注册流程进入 auth {state.get('page_type')}，尝试继续...")
+            if _continue_auth_workspace_or_consent_page(page, log):
+                recovered_state = _wait_for_recognized_registration_state(page, log, timeout=15)
+                if recovered_state.get("page_type"):
+                    state = recovered_state
+                else:
+                    state = _extract_flow_state(None, str(getattr(page, "url", "") or ""))
+                continue
+            log("auth workspace/consent 未找到可点击继续项，尝试打开 ChatGPT 首页完成会话")
+            _goto_with_retry(page, f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000, log=log)
+            state = _derive_registration_state_from_page(page)
+            continue
+
         if _requires_registration_navigation(state):
             target_url = _normalize_url(str(state.get("continue_url") or state.get("current_url") or ""), OPENAI_AUTH)
             if not target_url:
@@ -4844,6 +4968,17 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             _goto_with_retry(page, target_url, wait_until="domcontentloaded", timeout=30000, log=log)
             state = _extract_flow_state(None, page.url)
             continue
+
+        if not state.get("page_type"):
+            recovered_state = _wait_for_recognized_registration_state(page, log, timeout=10)
+            if recovered_state.get("page_type"):
+                state = recovered_state
+                continue
+            log(
+                "注册状态暂未识别，继续进入 ChatGPT session 校验: "
+                f"url={str(recovered_state.get('current_url') or getattr(page, 'url', '') or '')[:120]}"
+            )
+            return _extract_flow_state(None, str(getattr(page, "url", "") or ""))
 
         raise RuntimeError(f"未支持的注册状态: page={state.get('page_type') or '-'}")
 

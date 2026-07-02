@@ -12,7 +12,12 @@ from .cpa_session import export_workspace_cpa_session_from_browser
 from .constants import CHATGPT_APP
 
 
-DEFAULT_WORKSPACE_IDS = "d1869eec-4d2d-4fce-967f-a1a6b906d51e"
+DEFAULT_WORKSPACE_IDS = "\n".join(
+    [
+        "631e1603-06cf-4f0b-b79b-d09fbfcfe98d",
+        "d1869eec-4d2d-4fce-967f-a1a6b906d51e",
+    ]
+)
 
 
 def parse_workspace_ids(raw: Any) -> list[str]:
@@ -167,6 +172,7 @@ def request_workspace_join_in_browser(
     interval_ms: int = 1500,
     max_retries: int = 3,
     retry_backoff_ms: int = 5000,
+    stop_after_first_success: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     _ensure_chatgpt_origin(page, log)
@@ -277,6 +283,8 @@ def request_workspace_join_in_browser(
             if attempt < max(int(max_retries), 0):
                 time.sleep(max(int(retry_backoff_ms), 0) / 1000)
         results.append(last_result)
+        if stop_after_first_success and last_result.get("ok"):
+            break
         if index < len(workspace_ids) - 1:
             time.sleep(max(int(interval_ms), 0) / 1000)
     return results
@@ -418,6 +426,66 @@ def _workspace_id_from_invite_url(invite_url: str, fallback_ids: list[str]) -> s
     return fallback_ids[0] if fallback_ids else ""
 
 
+def _invite_matches_workspace_ids(invite_url: str, workspace_ids: list[str]) -> bool:
+    parsed_id = _workspace_id_from_invite_url(invite_url, [])
+    return not parsed_id or not workspace_ids or parsed_id in set(workspace_ids)
+
+
+def _wait_for_workspace_invite_link(
+    *,
+    mailbox,
+    mailbox_account: MailboxAccount,
+    workspace_ids: list[str],
+    before_ids: set,
+    timeout: int,
+    log: Callable[[str], None] | None = None,
+) -> str:
+    """Wait for a new workspace invite, then fall back to an existing invite.
+
+    ChatGPT may return success for a request that already has a pending invite
+    without sending a fresh email.  In that case a strict ``before_ids`` filter
+    would time out even though the mailbox already contains a usable
+    ``k12-invite`` link.  The fallback keeps normal fresh-mail behavior first,
+    then reuses an existing matching invite only after the new-mail wait fails.
+    """
+
+    timeout = max(int(timeout), 1)
+    first_error: Exception | None = None
+    try:
+        invite_url = mailbox.wait_for_link(
+            mailbox_account,
+            keyword="k12-invite",
+            timeout=timeout,
+            before_ids=before_ids or None,
+        )
+        if _invite_matches_workspace_ids(str(invite_url or ""), workspace_ids):
+            return str(invite_url or "")
+        _log(
+            log,
+            "Workspace Join: 新邀请邮件 workspace_id 与成功请求不匹配，"
+            "尝试复用邮箱中已有邀请链接",
+        )
+    except Exception as exc:
+        first_error = exc
+        _log(log, f"Workspace Join: 未等到新邀请邮件，尝试复用已有 k12-invite: {exc}")
+
+    try:
+        invite_url = mailbox.wait_for_link(
+            mailbox_account,
+            keyword="k12-invite",
+            timeout=min(timeout, 20),
+            before_ids=set(),
+        )
+        if _invite_matches_workspace_ids(str(invite_url or ""), workspace_ids):
+            _log(log, "Workspace Join: 已复用邮箱中已有 k12-invite 邀请链接")
+            return str(invite_url or "")
+        raise RuntimeError("existing invite workspace_id does not match successful request")
+    except Exception as exc:
+        if first_error is not None:
+            raise first_error
+        raise exc
+
+
 def run_workspace_join_flow(
     page,
     session_info: dict[str, Any],
@@ -460,10 +528,16 @@ def run_workspace_join_flow(
             interval_ms=_int_config(config.get("interval_ms"), 1500),
             max_retries=_int_config(config.get("max_retries"), 3),
             retry_backoff_ms=_int_config(config.get("retry_backoff_ms"), 5000),
+            stop_after_first_success=True,
             log=log,
         )
         result["request_results"] = request_results
-        result["request_ok"] = all(bool(item.get("ok")) for item in request_results)
+        successful_workspace_ids = [
+            str(item.get("workspace_id") or "").strip()
+            for item in request_results
+            if item.get("ok") and str(item.get("workspace_id") or "").strip()
+        ]
+        result["request_ok"] = bool(successful_workspace_ids)
     except Exception as exc:
         result["error"] = f"workspace request failed: {exc}"
         return {"workspace_join": result}
@@ -484,11 +558,13 @@ def run_workspace_join_flow(
     try:
         timeout = _int_config(config.get("invite_timeout"), 240)
         _log(log, f"Workspace Join: 等待邀请邮件 k12-invite，timeout={timeout}s")
-        invite_url = mailbox.wait_for_link(
-            mailbox_account,
-            keyword="k12-invite",
+        invite_url = _wait_for_workspace_invite_link(
+            mailbox=mailbox,
+            mailbox_account=mailbox_account,
+            workspace_ids=successful_workspace_ids or workspace_ids,
+            before_ids=before_ids,
             timeout=timeout,
-            before_ids=before_ids or None,
+            log=log,
         )
         result["invite_url"] = str(invite_url or "")
     except Exception as exc:
@@ -500,7 +576,10 @@ def run_workspace_join_flow(
     result["ok"] = bool(accept_result.get("ok"))
 
     if result.get("ok") and _bool_config(config.get("export_cpa_json"), True):
-        workspace_id = _workspace_id_from_invite_url(result["invite_url"], workspace_ids)
+        workspace_id = _workspace_id_from_invite_url(
+            result["invite_url"],
+            successful_workspace_ids or workspace_ids,
+        )
         try:
             _log(log, "Workspace Join: start switching workspace and exporting CPA JSON")
             export_result = export_workspace_cpa_session_from_browser(

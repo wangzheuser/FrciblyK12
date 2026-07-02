@@ -709,24 +709,56 @@ def _switch_workspace_via_profile_menu_stepwise(
         move_after_click=True,
         post_click_wait_ms=350,
     )
-    ready = _click_until_next_dom_target(
-        page,
-        click_script=_WORKSPACE_RADIO_TARGET_SCRIPT,
-        next_script=_WORKSPACE_READY_TARGET_SCRIPT,
-        click_label="workspace radio item",
-        next_label="workspace ready signal",
-        timeout_ms=_remaining_ms(deadline),
-        log=log,
-        post_click_wait_ms=800,
-    )
-    if not ready.get("text"):
-        ready = _wait_workspace_ready_after_click(page, _remaining_ms(deadline, minimum=3000))
+    _click_dom_target(page, workspace, label="workspace radio item", log=log)
+    _page_wait(page, 1000)
+    ready: dict[str, Any] = {}
+    ready_error = ""
+    navigation_recovered = False
+    for attempt in range(2):
+        try:
+            ready = _wait_workspace_ready_after_click(
+                page,
+                min(_remaining_ms(deadline, minimum=3000), 6000),
+            )
+            break
+        except Exception as exc:
+            ready_error = str(exc)[:240]
+            if _looks_like_navigation_interrupt(exc):
+                navigation_recovered = True
+                _page_wait(page, 1000)
+                continue
+            radio_probe = _wait_for_dom_target(
+                page,
+                _WORKSPACE_RADIO_TARGET_SCRIPT,
+                label="workspace radio item",
+                timeout_ms=600,
+            )
+            if isinstance(radio_probe, dict) and radio_probe.get("ok") and attempt == 0:
+                _safe_log(log, "Workspace Join: workspace radio item still visible, clicking once more")
+                _click_dom_target(page, radio_probe, label="workspace radio item", log=log)
+                _page_wait(page, 1000)
+                continue
+            _page_wait(page, 1000)
+    if not ready.get("ok"):
+        _safe_log(
+            log,
+            "Workspace Join: workspace ready signal not confirmed; "
+            f"continue with selected workspace item: {ready_error}",
+        )
+        ready = {
+            "ok": True,
+            "text": str(workspace.get("text") or ""),
+            "source": "selected_item_unconfirmed",
+            "unconfirmed": True,
+        }
     return {
         "ok": True,
         "workspaceId": str(workspace_id or "").strip(),
         "selectedText": str(workspace.get("text") or ""),
         "profileText": str(ready.get("text") or ""),
         "readySource": str(ready.get("source") or ""),
+        "readyUnconfirmed": bool(ready.get("unconfirmed")),
+        "navigationRecovered": navigation_recovered or None,
         "stepwise": True,
     }
 

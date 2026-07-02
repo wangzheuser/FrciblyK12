@@ -5,6 +5,7 @@ from platforms.chatgpt.browser_register import (
     _browser_registration_flow,
     _click_about_you_submit,
     _email_otp_page_has_visible_code_input,
+    _infer_page_type,
     _install_websocket_blocker,
     _new_browser_page,
     _submit_otp_via_page,
@@ -57,6 +58,11 @@ def test_new_browser_page_disables_default_viewport_for_camoufox_protocol_compat
 
     assert _new_browser_page(browser) == "page"
     assert browser.calls == [{"no_viewport": True}]
+
+
+def test_infer_page_type_accepts_auth_workspace_without_select_suffix():
+    assert _infer_page_type(None, "https://auth.openai.com/workspace") == "workspace_selection"
+    assert _infer_page_type(None, "https://auth.openai.com/organization") == "organization_selection"
 
 
 def test_new_browser_page_falls_back_for_wrappers_without_no_viewport_argument():

@@ -9,7 +9,7 @@ from platforms.chatgpt.workspace_join import (
 
 
 def test_parse_workspace_ids_uses_default_when_blank():
-    assert parse_workspace_ids("") == [DEFAULT_WORKSPACE_IDS]
+    assert parse_workspace_ids("") == parse_workspace_ids(DEFAULT_WORKSPACE_IDS)
 
 
 def test_parse_workspace_ids_accepts_commas_and_lines():
@@ -193,6 +193,35 @@ def test_request_workspace_join_does_not_retry_same_domain_rejection():
     assert page.evaluate_calls == 2
 
 
+def test_request_workspace_join_can_stop_after_first_success():
+    class FakePage:
+        url = "https://chatgpt.com/"
+
+        def __init__(self):
+            self.requested: list[str] = []
+
+        def evaluate(self, _script, arg=None):
+            if arg is None:
+                return {"ok": True, "status": 200, "accessToken": "page-access", "text": ""}
+            self.requested.append(arg["wsId"])
+            return {
+                "ok": True,
+                "status": 200,
+                "url": f"https://chatgpt.com/backend-api/accounts/{arg['wsId']}/invites/request",
+                "text": '{"success":true}',
+            }
+
+    page = FakePage()
+    result = request_workspace_join_in_browser(
+        page,
+        workspace_ids=["workspace-1", "workspace-2"],
+        stop_after_first_success=True,
+    )
+
+    assert [item["workspace_id"] for item in result] == ["workspace-1"]
+    assert page.requested == ["workspace-1"]
+
+
 def test_workspace_join_flow_exports_cpa_and_returns_workspace_credentials(monkeypatch, tmp_path):
     import platforms.chatgpt.workspace_join as workspace_join
 
@@ -248,6 +277,81 @@ def test_workspace_join_flow_exports_cpa_and_returns_workspace_credentials(monke
     assert result["session_token"] == "workspace-session"
     assert result["account_id"] == "workspace-account"
     assert result["workspace_join"]["cpa_export"]["path"].endswith("member.json")
+
+
+def test_workspace_join_flow_uses_first_successful_workspace_and_existing_invite(monkeypatch, tmp_path):
+    import platforms.chatgpt.workspace_join as workspace_join
+
+    class FakeMailbox:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def get_current_ids(self, _account):
+            return {"old-message"}
+
+        def wait_for_link(self, *_args, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs.get("before_ids"):
+                raise TimeoutError("no fresh invite")
+            return "https://chatgpt.com/k12-invite?wId=workspace-2&aiId=invite-2"
+
+    mailbox = FakeMailbox()
+    exported: dict[str, str] = {}
+
+    def fake_request(*_args, **kwargs):
+        assert kwargs["stop_after_first_success"] is True
+        return [
+            {"ok": False, "workspace_id": "workspace-1", "status": 401},
+            {"ok": True, "workspace_id": "workspace-2", "status": 200},
+        ]
+
+    def fake_export(*_args, **kwargs):
+        exported["workspace_id"] = kwargs["workspace_id"]
+        return {
+            "ok": True,
+            "path": str(tmp_path / "member.json"),
+            "email": "member@example.com",
+            "account_id": "workspace-account",
+            "expired": "2026-07-01T00:00:00Z",
+            "access_token": "workspace-access",
+            "refresh_token": "",
+            "id_token": "workspace-id",
+            "session_token": "workspace-session",
+        }
+
+    monkeypatch.setattr(workspace_join, "request_workspace_join_in_browser", fake_request)
+    monkeypatch.setattr(
+        workspace_join,
+        "open_workspace_invite_in_browser",
+        lambda *_args, **_kwargs: {"ok": True, "clicked": True},
+    )
+    monkeypatch.setattr(
+        workspace_join,
+        "export_workspace_cpa_session_from_browser",
+        fake_export,
+        raising=False,
+    )
+
+    result = run_workspace_join_flow(
+        object(),
+        {"access_token": "registration-access"},
+        mailbox=mailbox,
+        mailbox_account=object(),
+        config={
+            "workspace_ids": "workspace-1\nworkspace-2",
+            "accept_invite": True,
+            "export_cpa_json": True,
+            "invite_timeout": 1,
+            "cpa_output_dir": str(tmp_path),
+        },
+    )
+
+    assert result["workspace_join"]["ok"] is True
+    assert result["workspace_id"] == "workspace-2"
+    assert exported["workspace_id"] == "workspace-2"
+    assert len(mailbox.calls) == 2
+    assert mailbox.calls[0]["before_ids"] == {"old-message"}
+    assert mailbox.calls[1]["before_ids"] == set()
 
 
 def test_workspace_join_flow_fails_when_cpa_export_fails(monkeypatch, tmp_path):
