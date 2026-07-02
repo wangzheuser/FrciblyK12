@@ -908,6 +908,36 @@ def _registration_use_proxy_pool_for_platform(platform_name: str, extra: dict[st
     return str(platform_name or "").strip().lower() != "chatgpt"
 
 
+def _is_proxy_related_registration_error(error: str) -> bool:
+    """注册失败是否应计入代理池失败统计。
+
+    账号注册链路会有验证码、页面状态、Workspace Join 等业务失败；这些失败
+    不代表代理不可用，不能把唯一代理误禁用。只有明确的网络/代理/连接类
+    错误才对代理池调用 report_fail。
+    """
+    text = str(error or "").lower()
+    return any(
+        token in text
+        for token in (
+            "proxy",
+            "network",
+            "connection",
+            "connect",
+            "timeout",
+            "timed out",
+            "ns_error_net",
+            "err_",
+            "tunnel",
+            "socks",
+            "tls",
+            "ssl",
+            "name_not_resolved",
+            "address_unreachable",
+            "failed to fetch",
+        )
+    )
+
+
 def _auto_followup_windsurf_payment(
     *,
     platform_name: str,
@@ -1520,9 +1550,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 logger.add_cashier_url(cashier_url)
             return True
         except Exception as exc:
-            if resolved_proxy:
-                proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
+            if resolved_proxy and _is_proxy_related_registration_error(error):
+                proxy_pool.report_fail(resolved_proxy)
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)

@@ -158,6 +158,13 @@ if (-not $SkipCheck) {
         & $PythonExe -m playwright install chromium
         Write-Success "Playwright 安装成功"
     }
+    $playwrightPatchScript = Join-Path $Root "tools\patch_playwright_firefox_driver.py"
+    if (Test-Path $playwrightPatchScript) {
+        $patchResult = & $PythonExe $playwrightPatchScript 2>$null
+        if ($LASTEXITCODE -eq 0 -and $patchResult) {
+            Write-Info "Playwright Firefox driver 兼容补丁: $patchResult"
+        }
+    }
 
     # 5. 检查前端依赖
     Write-Info "检查前端依赖..."

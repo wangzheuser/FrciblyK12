@@ -867,6 +867,7 @@ class ChatGPTPlatform(BasePlatform):
                 ChatGPTBrowserRegister,
                 _build_proxy_config,
                 _do_codex_oauth,
+                _new_browser_page,
             )
             from platforms.chatgpt.browser_get_rt import (
                 setup_oauth_state_capture,
@@ -950,9 +951,9 @@ class ChatGPTPlatform(BasePlatform):
                         log_fn(f"  get_rt HAR capture init failed, continue without HAR: {exc}")
                         record_har_path = None
                         har_context = None
-                        page = browser.new_page()
+                        page = _new_browser_page(browser)
                 else:
-                    page = browser.new_page()
+                    page = _new_browser_page(browser)
 
                 try:
                     setup_oauth_state_capture(page, log=log_fn)
@@ -1043,6 +1044,7 @@ class ChatGPTPlatform(BasePlatform):
                 ChatGPTBrowserRegister,
                 _build_proxy_config,
                 _do_codex_oauth,
+                _new_browser_page,
             )
             from platforms.chatgpt.browser_get_rt import setup_phone_otp_skip_interception
             from platforms.chatgpt.oauth import generate_oauth_url
@@ -1088,7 +1090,7 @@ class ChatGPTPlatform(BasePlatform):
                     launch_opts["proxy"] = cam_proxy
 
             with reg._open_browser(launch_opts) as browser:
-                page = browser.new_page()
+                page = _new_browser_page(browser)
                 setup_phone_otp_skip_interception(page, log=log_fn)
                 log_fn("  获取rt(绕过): session/select 拦截器已就绪（phone_otp→consent）")
 

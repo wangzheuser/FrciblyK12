@@ -38,6 +38,61 @@ def _apply_camoufox_visible_window_limit(
     launch_opts.setdefault("window", CAMOUFOX_VISIBLE_WINDOW_SIZE)
 
 
+def _new_browser_page(browser):
+    """Open a page without Playwright/Patchright's default viewport emulation.
+
+    Some browser backends currently reject the generated
+    ``Browser.setDefaultViewport`` payload because it contains
+    ``viewport.isMobile``.  Disabling the default viewport avoids that protocol
+    path while still allowing the real browser window size to be controlled by
+    launch options.
+    """
+    try:
+        return browser.new_page(no_viewport=True)
+    except TypeError:
+        # BitBrowser's compatibility wrapper exposes ``new_page()`` without
+        # keyword arguments and already reuses the profile's default context.
+        return browser.new_page()
+
+
+def _install_websocket_blocker(page, log: Callable[[str], None] | None = None) -> None:
+    """Abort WebSocket upgrades that can crash the Firefox/Camoufox driver.
+
+    The bundled Playwright Firefox dispatcher may assert when a page opens a
+    WebSocket whose request bookkeeping was not emitted by the browser backend.
+    ChatGPT opens realtime/background sockets that are not needed for the
+    registration/session/Workspace Join chain, so blocking them keeps the
+    driver alive while ordinary HTTP requests continue.
+    """
+
+    def _route_handler(route):
+        try:
+            request = getattr(route, "request", None)
+            resource_type = getattr(request, "resource_type", "")
+            if callable(resource_type):
+                resource_type = resource_type()
+            url = str(getattr(request, "url", "") or "")
+            if str(resource_type or "").lower() == "websocket" or url.lower().startswith(("ws://", "wss://")):
+                route.abort()
+                return
+        except Exception:
+            try:
+                route.abort()
+                return
+            except Exception:
+                return
+        try:
+            route.continue_()
+        except Exception:
+            pass
+
+    try:
+        page.route("**/*", _route_handler)
+    except Exception as exc:
+        if callable(log):
+            log(f"WebSocket blocker install failed: {str(exc)[:160]}")
+
+
 def _is_transient_nav_error(exc: BaseException) -> bool:
     """page.goto / page.reload 抛错是否属于可重试的瞬时网络断连。
 
@@ -2172,21 +2227,69 @@ def _submit_browser_user_register(page, email: str, password: str, device_id: st
 
 
 def _send_browser_email_otp(page) -> dict:
+    try:
+        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
+    except Exception:
+        user_agent = _random_chrome_ua()
+    referer = _normalize_url(str(getattr(page, "url", "") or ""), OPENAI_AUTH) or f"{OPENAI_AUTH}/email-verification"
+    try:
+        device_id = str((_get_cookies(page) or {}).get("oai-did") or "").strip()
+    except Exception:
+        device_id = ""
+    extra_headers = {
+        "sec-fetch-site": "same-origin",
+        **_generate_datadog_trace_headers(),
+    }
+    if device_id:
+        extra_headers["oai-device-id"] = device_id
     _browser_pause(page)
     return _browser_fetch(
         page,
         f"{OPENAI_AUTH}/api/accounts/email-otp/send",
         method="GET",
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "referer": f"{OPENAI_AUTH}/create-account/password",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "accept-language": "en-US,en;q=0.9",
-        },
+        headers=_build_browser_headers(
+            user_agent=user_agent,
+            accept="application/json, text/plain, */*",
+            referer=referer,
+            origin=OPENAI_AUTH,
+            extra_headers=extra_headers,
+        ),
         redirect="follow",
     )
+
+
+def _email_otp_page_has_visible_code_input(page) -> bool:
+    """当前 email-verification 页面是否已经渲染可填写的验证码输入框。
+
+    ChatGPT/Platform 的 auth 页面进入 email-verification 时通常已经自动发送
+    OTP。此时再调用 ``/api/accounts/email-otp/send`` 会把
+    ``email_verification_mode`` 从 ``passwordless_signup`` 刷成 ``onboarding``，
+    后续页面自己的 validate 请求会返回 ``invalid_state``。因此只有页面尚未
+    准备好验证码输入框时才考虑显式 resend。
+    """
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                  };
+                  const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea'));
+                  return inputs.some((el) => {
+                    if (!visible(el) || el.disabled || el.readOnly) return false;
+                    const hint = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.autocomplete || ''} ${el.getAttribute('aria-label') || ''} ${el.inputMode || ''}`.toLowerCase();
+                    return /code|otp|one[- ]?time|verification|numeric|認証|確認|验证码|驗證碼|代码|代碼|codigo|código/.test(hint);
+                  });
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
 
 
 def _decode_oauth_session_cookie(cookies_dict: dict) -> dict:
@@ -3727,6 +3830,30 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
 
+    def _email_otp_api_fallback(reason: str, *, direct: bool = False) -> dict | None:
+        current_url = str(getattr(page, "url", "") or "")
+        if not _is_email_otp({"page_type": "", "continue_url": "", "current_url": current_url}):
+            return None
+        try:
+            user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
+        except Exception:
+            user_agent = _random_chrome_ua()
+        try:
+            device_id = str((_get_cookies(page) or {}).get("oai-did") or "").strip()
+        except Exception:
+            device_id = ""
+        log(reason if direct else f"{reason}，改用 email-otp validate 接口提交")
+        try:
+            return _validate_browser_email_otp(
+                page,
+                otp,
+                device_id,
+                user_agent,
+                _normalize_url(current_url, OPENAI_AUTH) or f"{OPENAI_AUTH}/email-verification",
+            )
+        except Exception as exc:  # noqa: BLE001 - 保留原业务错误语义
+            return {"ok": False, "status": 0, "url": current_url, "data": None, "text": f"email-otp validate 接口提交异常: {exc}"}
+
     # 等待页面加载完成，确保 OTP 输入框已渲染
     try:
         page.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -3809,6 +3936,9 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 continue
 
     if not filled:
+        api_fallback = _email_otp_api_fallback("验证码页未发现可见输入框")
+        if api_fallback is not None:
+            return api_fallback
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
@@ -3852,7 +3982,77 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
+    api_fallback = _email_otp_api_fallback("验证码页提交后未跳转")
+    if api_fallback is not None:
+        return api_fallback
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+
+
+ABOUT_YOU_SUBMIT_SELECTORS = [
+    'button:has-text("Finish creating account")',
+    'button:has-text("finish creating account")',
+    'button:has-text("Termina de crear tu cuenta")',
+    'button:has-text("Terminar de crear tu cuenta")',
+    'button:has-text("Termine de criar sua conta")',
+    'button:has-text("Terminer la création")',
+    'button:has-text("Kontoerstellung abschließen")',
+    'button:has-text("Termina di creare")',
+    'button:has-text("アカウントの作成を完了")',
+    'button:has-text("完成账号创建")',
+    'button:has-text("完成帳號建立")',
+    'button[type="submit"]',
+    'button[data-testid="continue-button"]',
+    'button:has-text("Continue")',
+    'button:has-text("continue")',
+    'button:has-text("Next")',
+    'button:has-text("next")',
+]
+
+
+def _click_about_you_submit(page, log) -> str:
+    selector = _click_first_no_wait(page, ABOUT_YOU_SUBMIT_SELECTORS, timeout=8)
+    if selector:
+        return selector
+    try:
+        result = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+              const form = document.querySelector('form[action*="/about-you" i]') || document.querySelector('form');
+              const buttons = Array.from(document.querySelectorAll('button[type="submit"], input[type="submit"], button'))
+                .filter((button) => visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+              const submit = buttons.find((button) => {
+                const text = normalize(button.innerText || button.value || button.textContent);
+                return /finish|create|continue|next|termina|terminar|termine|terminer|abschlie|completa|完了|完成|继续|下一步/i.test(text);
+              }) || buttons[0];
+              if (form && typeof form.requestSubmit === 'function') {
+                form.requestSubmit(submit && submit.tagName === 'BUTTON' ? submit : undefined);
+              } else if (submit) {
+                submit.click();
+              } else if (form) {
+                form.submit();
+              } else {
+                return { ok: false, reason: 'missing_submit' };
+              }
+              return { ok: true, text: normalize(submit ? (submit.innerText || submit.value || submit.textContent) : '') };
+            }
+            """
+        )
+    except Exception as exc:
+        log(f"about_you DOM 提交 fallback 异常: {str(exc)[:160]}")
+        return ""
+    if isinstance(result, dict) and result.get("ok"):
+        text = str(result.get("text") or "").strip()
+        label = text[:80] if text else "submit"
+        log(f"about_you 已使用 DOM requestSubmit fallback: {label}")
+        return f"dom:{label}"
+    return ""
 
 
 def _submit_about_you_via_page(page, log) -> dict:
@@ -4405,20 +4605,7 @@ def _submit_about_you_via_page(page, log) -> dict:
         raise RuntimeError("about_you 未成功填写 Birthday/Age")
     _browser_pause(page)
 
-    submit_selector = _click_first(
-        page,
-        [
-            'button:has-text("Finish creating account")',
-            'button:has-text("finish creating account")',
-            'button[type="submit"]',
-            'button[data-testid="continue-button"]',
-            'button:has-text("Continue")',
-            'button:has-text("continue")',
-            'button:has-text("Next")',
-            'button:has-text("next")',
-        ],
-        timeout=8,
-    )
+    submit_selector = _click_about_you_submit(page, log)
     if not submit_selector:
         raise RuntimeError("about_you 未找到提交按钮")
     log(f"about_you 已点击继续按钮: {submit_selector}")
@@ -4488,20 +4675,7 @@ def _submit_about_you_via_page(page, log) -> dict:
                 if len(date_parts) == 3 and _sync_hidden_birthday_input(page, f"{yyyy}-{mm}-{dd}", log):
                     fill_result["birthdate"] = True
                 _browser_pause(page)
-                retry_submit_selector = _click_first(
-                    page,
-                    [
-                        'button:has-text("Finish creating account")',
-                        'button:has-text("finish creating account")',
-                        'button[type="submit"]',
-                        'button[data-testid="continue-button"]',
-                        'button:has-text("Continue")',
-                        'button:has-text("continue")',
-                        'button:has-text("Next")',
-                        'button:has-text("next")',
-                    ],
-                    timeout=5,
-                )
+                retry_submit_selector = _click_about_you_submit(page, log)
                 if retry_submit_selector:
                     log(f"about_you 重试提交按钮: {retry_submit_selector}")
                     time.sleep(0.5)
@@ -4534,6 +4708,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
     )
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
     register_submitted = False
+    email_otp_sent = False
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -4594,6 +4769,17 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
         if _is_email_otp(state):
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
+            if not email_otp_sent:
+                if _email_otp_page_has_visible_code_input(page):
+                    log("邮箱验证码页面已显示验证码输入框，等待页面自动发送的验证码")
+                else:
+                    send_resp = _send_browser_email_otp(page)
+                    send_status = int(send_resp.get("status") or 0)
+                    if send_resp.get("ok"):
+                        log(f"邮箱验证码发送状态: {send_status}")
+                    else:
+                        log(f"邮箱验证码发送失败，继续等待页面可能已自动发送的验证码: HTTP {send_status} {(send_resp.get('text') or '')[:200]}")
+                email_otp_sent = True
             log("等待 ChatGPT 验证码")
             code = otp_callback()
             if not code:
@@ -4724,7 +4910,8 @@ class ChatGPTBrowserRegister:
                 launch_opts["geoip"] = True
 
         with self._open_browser(launch_opts) as browser:
-            page = browser.new_page()
+            page = _new_browser_page(browser)
+            _install_websocket_blocker(page, self.log)
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
                 page,
@@ -4778,7 +4965,8 @@ class ChatGPTBrowserRegister:
                 launch_opts["proxy"] = proxy
         try:
             with self._open_browser(launch_opts) as browser:
-                page = browser.new_page()
+                page = _new_browser_page(browser)
+                _install_websocket_blocker(page, self.log)
                 self.log("  全新浏览器 OAuth 开始...")
                 result = _do_codex_oauth(
                     page, {}, email, password,

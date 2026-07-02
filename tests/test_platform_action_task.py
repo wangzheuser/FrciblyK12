@@ -238,6 +238,47 @@ def test_chatgpt_register_task_uses_proxy_pool_when_requested(monkeypatch):
     )
 
 
+def test_register_task_does_not_mark_proxy_failed_for_non_proxy_registration_error(monkeypatch):
+    captured = {"fail_calls": []}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            raise RuntimeError("验证码校验失败: 验证码页提交后未跳转")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", lambda *args, **kwargs: FakePlatform())
+
+    from core.proxy_pool import proxy_pool
+
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": "http://pool-proxy.example:8080")
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: captured.setdefault("success_proxy", url))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: captured["fail_calls"].append(url))
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "registration_use_proxy_pool": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert captured["fail_calls"] == []
+    assert logger.finished == (
+        tasks_module.TASK_STATUS_FAILED,
+        "验证码校验失败: 验证码页提交后未跳转",
+    )
+
+
 def test_phone_bind_task_passes_logger_and_browser_mode(monkeypatch):
     seen = {}
 

@@ -5,6 +5,8 @@ import uuid
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+import requests
+
 from core.base_mailbox import MailboxAccount
 from .cpa_session import export_workspace_cpa_session_from_browser
 from .constants import CHATGPT_APP
@@ -102,6 +104,60 @@ def _fetch_access_token_from_page(page, log: Callable[[str], None] | None) -> st
     )
 
 
+def _request_workspace_join_direct(
+    *,
+    workspace_id: str,
+    route: str,
+    access_token: str,
+    device_id: str,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    url = f"{CHATGPT_APP}/backend-api/accounts/{workspace_id}/invites/{route}"
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "accept": "*/*",
+                "authorization": f"Bearer {access_token}",
+                "content-type": "application/json",
+                "oai-device-id": device_id,
+                "oai-language": "en-US",
+            },
+            data="",
+            timeout=timeout,
+        )
+        return {
+            "ok": bool(response.ok),
+            "status": int(response.status_code),
+            "url": str(getattr(response, "url", "") or url),
+            "text": str(getattr(response, "text", "") or "")[:500],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": 0,
+            "url": url,
+            "text": f"direct request failed: {str(exc)[:300]}",
+        }
+
+
+def _is_terminal_workspace_join_rejection(result: dict[str, Any]) -> bool:
+    text = str((result or {}).get("text") or "").lower()
+    status = int((result or {}).get("status") or 0)
+    if status in (400, 401, 403) and any(
+        token in text
+        for token in (
+            "same domain",
+            "only users with emails",
+            "not eligible",
+            "not allowed",
+            "workspace not found",
+        )
+    ):
+        return True
+    return False
+
+
 def request_workspace_join_in_browser(
     page,
     *,
@@ -117,9 +173,11 @@ def request_workspace_join_in_browser(
     fallback_token = str(access_token or "").strip()
     try:
         access_token = _fetch_access_token_from_page(page, log)
+        page_usable = True
     except Exception as exc:
         _log(log, f"Workspace Join: page session fetch failed, using registration token if available: {exc}")
         access_token = fallback_token
+        page_usable = False
     if not access_token:
         raise RuntimeError("缺少 ChatGPT access_token，无法发送 workspace join request")
 
@@ -135,42 +193,75 @@ def request_workspace_join_in_browser(
                 f"Workspace Join: POST /accounts/{ws_id[:8]}/invites/{normalized_route} "
                 f"(第 {attempt + 1} 次)",
             )
-            result = page.evaluate(
-                """
-                async ({ wsId, route, token, deviceId }) => {
-                  const response = await fetch(`/backend-api/accounts/${wsId}/invites/${route}`, {
-                    method: "POST",
-                    credentials: "include",
-                    mode: "cors",
-                    headers: {
-                      accept: "*/*",
-                      authorization: `Bearer ${token}`,
-                      "content-type": "application/json",
-                      "oai-device-id": deviceId,
-                      "oai-language": navigator.language || "en-US",
-                    },
-                    body: "",
-                  });
-                  const text = await response.text().catch(() => "");
-                  return {
-                    ok: response.ok,
-                    status: response.status,
-                    url: response.url,
-                    text: text.slice(0, 500),
-                  };
-                }
-                """,
-                {
-                    "wsId": ws_id,
-                    "route": normalized_route,
-                    "token": access_token,
-                    "deviceId": device_id,
-                },
-            )
+            if page_usable:
+                try:
+                    result = page.evaluate(
+                        """
+                        async ({ wsId, route, token, deviceId }) => {
+                          const controller = new AbortController();
+                          const timer = setTimeout(() => controller.abort(new Error("workspace join request timeout")), 30000);
+                          try {
+                            const response = await fetch(`/backend-api/accounts/${wsId}/invites/${route}`, {
+                              method: "POST",
+                              credentials: "include",
+                              mode: "cors",
+                              signal: controller.signal,
+                              headers: {
+                                accept: "*/*",
+                                authorization: `Bearer ${token}`,
+                                "content-type": "application/json",
+                                "oai-device-id": deviceId,
+                                "oai-language": navigator.language || "en-US",
+                              },
+                              body: "",
+                            });
+                            const text = await response.text().catch(() => "");
+                            return {
+                              ok: response.ok,
+                              status: response.status,
+                              url: response.url,
+                              text: text.slice(0, 500),
+                            };
+                          } finally {
+                            clearTimeout(timer);
+                          }
+                        }
+                        """,
+                        {
+                            "wsId": ws_id,
+                            "route": normalized_route,
+                            "token": access_token,
+                            "deviceId": device_id,
+                        },
+                    )
+                except Exception as exc:
+                    page_usable = False
+                    _log(log, f"Workspace Join: page request failed, direct HTTP fallback: {exc}")
+                    result = _request_workspace_join_direct(
+                        workspace_id=ws_id,
+                        route=normalized_route,
+                        access_token=access_token,
+                        device_id=device_id,
+                    )
+            else:
+                _log(log, "Workspace Join: direct HTTP fallback")
+                result = _request_workspace_join_direct(
+                    workspace_id=ws_id,
+                    route=normalized_route,
+                    access_token=access_token,
+                    device_id=device_id,
+                )
             last_result = dict(result or {})
             last_result["workspace_id"] = ws_id
             if last_result.get("ok"):
                 _log(log, f"Workspace Join: {ws_id[:8]} request 成功 HTTP {last_result.get('status')}")
+                break
+            if _is_terminal_workspace_join_rejection(last_result):
+                _log(
+                    log,
+                    f"Workspace Join: {ws_id[:8]} request 被服务端终止拒绝，停止重试 HTTP {last_result.get('status')}: "
+                    f"{str(last_result.get('text') or '')[:180]}",
+                )
                 break
             if last_result.get("status") in (401, 403) and attempt < max(int(max_retries), 0):
                 _log(log, "Workspace Join: accessToken rejected, refreshing session from page")

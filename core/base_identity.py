@@ -45,6 +45,16 @@ def normalize_oauth_provider(value: Optional[str]) -> str:
     return OAUTH_PROVIDER_ALIASES.get(raw, raw)
 
 
+def _is_plus_alias_for_mailbox(requested_email: str, mailbox_email: str) -> bool:
+    requested = (requested_email or "").strip().lower()
+    mailbox = (mailbox_email or "").strip().lower()
+    if not requested or not mailbox or "@" not in requested or "@" not in mailbox:
+        return False
+    requested_local, requested_domain = requested.rsplit("@", 1)
+    mailbox_local, mailbox_domain = mailbox.rsplit("@", 1)
+    return requested_domain == mailbox_domain and requested_local.startswith(f"{mailbox_local}+")
+
+
 @dataclass
 class IdentityMaterial:
     identity_provider: str = "mailbox"
@@ -86,7 +96,7 @@ class MailboxIdentityProvider(BaseIdentityProvider):
         if not requested_email and not email:
             provider_name = getattr(self.mailbox, "__class__", type(self.mailbox)).__name__
             raise ValueError(f"{provider_name} 未返回可用邮箱，请检查 mailbox provider 配置或服务状态")
-        if requested_email and email and requested_email != email:
+        if requested_email and email and requested_email != email and not _is_plus_alias_for_mailbox(requested_email, email):
             raise ValueError(f"传入邮箱 {requested_email} 与当前邮箱 provider 返回的 {email} 不一致")
         before_ids = self.mailbox.get_current_ids(mail_acct) if mail_acct else set()
         return IdentityMaterial(

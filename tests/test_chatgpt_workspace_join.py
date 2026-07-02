@@ -3,6 +3,7 @@ from platforms.chatgpt.workspace_join import (
     DEFAULT_WORKSPACE_IDS,
     open_workspace_invite_in_browser,
     parse_workspace_ids,
+    request_workspace_join_in_browser,
     run_workspace_join_flow,
 )
 
@@ -114,6 +115,82 @@ def test_open_workspace_invite_waits_for_late_invite_button():
     assert result["ok"] is True
     assert result["clicked"] is True
     assert page.evaluate_calls == 3
+
+
+def test_request_workspace_join_falls_back_to_direct_http_when_page_driver_is_unusable(monkeypatch):
+    import platforms.chatgpt.workspace_join as workspace_join
+
+    class FakePage:
+        url = "https://chatgpt.com/"
+
+        def evaluate(self, *_args, **_kwargs):
+            raise RuntimeError("Connection closed while reading from the driver")
+
+    class FakeResponse:
+        status_code = 200
+        ok = True
+        url = "https://chatgpt.com/backend-api/accounts/workspace-1/invites/request"
+        text = "{}"
+
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return FakeResponse()
+
+    monkeypatch.setattr(workspace_join.requests, "post", fake_post)
+
+    logs: list[str] = []
+    result = request_workspace_join_in_browser(
+        FakePage(),
+        access_token="registration-access",
+        workspace_ids=["workspace-1"],
+        log=logs.append,
+    )
+
+    assert result == [
+        {
+            "ok": True,
+            "status": 200,
+            "url": "https://chatgpt.com/backend-api/accounts/workspace-1/invites/request",
+            "text": "{}",
+            "workspace_id": "workspace-1",
+        }
+    ]
+    assert captured["url"].endswith("/backend-api/accounts/workspace-1/invites/request")
+    assert captured["kwargs"]["headers"]["authorization"] == "Bearer registration-access"
+    assert any("direct HTTP fallback" in item for item in logs)
+
+
+def test_request_workspace_join_does_not_retry_same_domain_rejection():
+    class FakePage:
+        url = "https://chatgpt.com/"
+
+        def __init__(self):
+            self.evaluate_calls = 0
+
+        def evaluate(self, *_args, **_kwargs):
+            self.evaluate_calls += 1
+            if self.evaluate_calls == 1:
+                return {"ok": True, "status": 200, "accessToken": "page-access", "text": ""}
+            return {
+                "ok": False,
+                "status": 401,
+                "url": "https://chatgpt.com/backend-api/accounts/workspace-1/invites/request",
+                "text": '{"detail":"Only users with emails on the same domain can request access to a workspace"}',
+            }
+
+    page = FakePage()
+    result = request_workspace_join_in_browser(
+        page,
+        access_token="registration-access",
+        workspace_ids=["workspace-1"],
+        max_retries=3,
+    )
+
+    assert result[0]["status"] == 401
+    assert page.evaluate_calls == 2
 
 
 def test_workspace_join_flow_exports_cpa_and_returns_workspace_credentials(monkeypatch, tmp_path):
