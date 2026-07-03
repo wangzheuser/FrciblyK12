@@ -58,6 +58,16 @@ aBaiAutoplus 是一个以 ChatGPT free 账号注册、管理和本地配置为�
 
 ### Windows
 
+推荐使用项目内置的一键开发启动脚本：
+
+```powershell
+.\dev-start.bat
+```
+
+脚本会自动检查依赖并同时启动后端 `http://localhost:8000` 与前端开发服务 `http://localhost:5173`。更多参数和排障说明见 [QUICK_START.md](./QUICK_START.md) 与 [开发模式启动说明.md](./开发模式启动说明.md)。
+
+如需手动启动生产模式，可执行：
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
