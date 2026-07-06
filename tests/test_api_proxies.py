@@ -18,6 +18,17 @@ def test_add_proxy(client):
     assert data["region"] == "US"
 
 
+def test_add_proxy_accepts_uuid_template(client):
+    template = "http://node.{uuid}:admin2012@127.0.0.1:9200"
+
+    resp = client.post("/api/proxies", json={"url": template, "region": "US"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["url"] == template
+    assert data["region"] == "US"
+
+
 def test_add_and_list_proxy(client):
     client.post("/api/proxies", json={"url": "http://127.0.0.1:7890"})
     resp = client.get("/api/proxies")

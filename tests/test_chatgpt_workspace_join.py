@@ -8,8 +8,10 @@ from platforms.chatgpt.workspace_join import (
 )
 
 
-def test_parse_workspace_ids_uses_default_when_blank():
-    assert parse_workspace_ids("") == parse_workspace_ids(DEFAULT_WORKSPACE_IDS)
+def test_parse_workspace_ids_returns_empty_when_blank():
+    assert DEFAULT_WORKSPACE_IDS == ""
+    assert parse_workspace_ids("") == []
+    assert parse_workspace_ids(None) == []
 
 
 def test_parse_workspace_ids_accepts_commas_and_lines():

@@ -26,6 +26,8 @@ def test_sidebar_top_level_nav_keeps_dashboard_chatgpt_and_settings():
 def test_sidebar_hides_accounts_menu_and_other_business_links():
     source = APP_TSX.read_text(encoding="utf-8")
 
+    assert "WelcomeDialog" not in source
+    assert "<WelcomeDialog" not in source
     assert "setAccountsOpen" not in source
     assert "getPlatforms" not in source
     assert "nav.accounts" not in source

@@ -26,3 +26,12 @@ def test_chatgpt_workspace_join_validation_error_is_rendered_in_register_modal()
     assert "startError" in source
     assert "setStartError" in source
     assert "{startError &&" in source
+
+
+def test_chatgpt_workspace_ids_default_to_empty_and_have_no_builtin_ids():
+    source = ACCOUNTS_TSX.read_text(encoding="utf-8")
+
+    assert "const DEFAULT_CHATGPT_WORKSPACE_IDS = ''" in source
+    assert "631e1603-06cf-4f0b-b79b-d09fbfcfe98d" not in source
+    assert "d1869eec-4d2d-4fce-967f-a1a6b906d51e" not in source
+    assert "留空时不加入 Workspace，仅导出 free 账号 CPA JSON" in source

@@ -103,7 +103,7 @@ export default function Proxies() {
             <textarea
               value={newProxy}
               onChange={e => setNewProxy(e.target.value)}
-              placeholder="http://user:pass@host:port"
+              placeholder="http://node.{uuid}:admin2012@127.0.0.1:9200"
               rows={8}
               className="control-surface control-surface-mono resize-none"
             />

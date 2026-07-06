@@ -286,6 +286,218 @@ def test_chatgpt_register_task_uses_proxy_pool_when_requested(monkeypatch):
     )
 
 
+def test_chatgpt_register_task_requests_prechecked_proxy_pool(monkeypatch):
+    captured = {}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+
+    def fake_build_platform(*args, **kwargs):
+        captured["proxy"] = kwargs.get("resolved_proxy")
+        return FakePlatform()
+
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", fake_build_platform)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_export_chatgpt_free_cpa_json", lambda *args, **kwargs: None)
+
+    from core.proxy_pool import proxy_pool
+
+    def fake_get_next(**kwargs):
+        captured["precheck"] = kwargs.get("precheck")
+        captured["max_attempts"] = kwargs.get("max_attempts")
+        captured["probe_urls"] = kwargs.get("probe_urls")
+        return "http://node.rendered:admin2012@127.0.0.1:9200"
+
+    monkeypatch.setattr(proxy_pool, "get_next", fake_get_next)
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: captured.setdefault("success_proxy", url))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: captured.setdefault("fail_proxy", url))
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "registration_use_proxy_pool": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert captured["precheck"] is True
+    assert captured["max_attempts"] == 99
+    assert "https://auth.openai.com/api/auth/csrf" in captured["probe_urls"]
+    assert captured["proxy"] == "http://node.rendered:admin2012@127.0.0.1:9200"
+    assert captured["success_proxy"] == "http://node.rendered:admin2012@127.0.0.1:9200"
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
+def test_chatgpt_register_task_does_not_count_pre_otp_proxy_error(monkeypatch):
+    captured = {"register_calls": 0, "fail_calls": []}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            captured["register_calls"] += 1
+            if captured["register_calls"] == 1:
+                raise RuntimeError("ProxyError: connection timed out before signup")
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", lambda *args, **kwargs: FakePlatform())
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_export_chatgpt_free_cpa_json", lambda *args, **kwargs: None)
+
+    from core.proxy_pool import proxy_pool
+
+    monkeypatch.setattr(proxy_pool, "get_next", lambda **kwargs: f"http://proxy-{captured['register_calls']}.example:8080")
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: captured.setdefault("success_proxy", url))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: captured["fail_calls"].append(url))
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "registration_use_proxy_pool": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert captured["register_calls"] == 2
+    assert captured["fail_calls"] == ["http://proxy-0.example:8080"]
+    assert captured["success_proxy"] == "http://proxy-1.example:8080"
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert not any(event[0] == "error" and "ProxyError" in event[1] for event in logger.events)
+    assert any(
+        event[0] == "log"
+        and event[2].get("level") == "warning"
+        and "不计入注册失败" in event[1]
+        for event in logger.events
+    )
+
+
+def test_chatgpt_register_task_does_not_start_when_prechecked_proxy_unavailable(monkeypatch):
+    captured = {"register_calls": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            captured["register_calls"] += 1
+            raise AssertionError("registration should not start without a prechecked proxy")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", lambda *args, **kwargs: FakePlatform())
+
+    from core.proxy_pool import proxy_pool
+
+    monkeypatch.setattr(proxy_pool, "get_next", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: captured.setdefault("success_proxy", url))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: captured.setdefault("fail_proxy", url))
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "registration_use_proxy_pool": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert captured["register_calls"] == 0
+    assert logger.finished == (
+        tasks_module.TASK_STATUS_FAILED,
+        "OTP 邮件发送前代理/网络失败，已重试 1 次仍未注册成功",
+    )
+    assert not any(event[0] == "error" for event in logger.events)
+    assert any(
+        event[0] == "log"
+        and event[2].get("level") == "warning"
+        and "代理池没有通过预检测" in event[1]
+        for event in logger.events
+    )
+
+
+def test_chatgpt_register_task_counts_proxy_error_after_otp_stage(monkeypatch):
+    captured = {"fail_calls": []}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            raise RuntimeError("获取验证码失败: proxy connection reset")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", lambda *args, **kwargs: FakePlatform())
+
+    from core.proxy_pool import proxy_pool
+
+    monkeypatch.setattr(proxy_pool, "get_next", lambda **kwargs: "http://proxy.example:8080")
+    monkeypatch.setattr(proxy_pool, "report_success", lambda url: captured.setdefault("success_proxy", url))
+    monkeypatch.setattr(proxy_pool, "report_fail", lambda url: captured["fail_calls"].append(url))
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "registration_use_proxy_pool": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert captured["fail_calls"] == ["http://proxy.example:8080"]
+    assert logger.finished == (
+        tasks_module.TASK_STATUS_FAILED,
+        "获取验证码失败: proxy connection reset",
+    )
+    assert any(event[0] == "error" and "获取验证码失败" in event[1] for event in logger.events)
+
+
 def test_register_task_releases_local_ms_alias_after_retryable_registration_error(monkeypatch, tmp_path):
     from core.local_ms_mailbox import LocalMicrosoftMailboxPool
 

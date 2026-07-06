@@ -980,6 +980,52 @@ def _registration_use_proxy_pool_for_platform(platform_name: str, extra: dict[st
     return str(platform_name or "").strip().lower() != "chatgpt"
 
 
+def _registration_proxy_probe_urls(platform_name: str, extra: dict[str, Any]) -> list[str]:
+    raw = (extra or {}).get("registration_proxy_probe_urls")
+    if isinstance(raw, str):
+        urls = [item.strip() for item in raw.split(",") if item.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        urls = [str(item or "").strip() for item in raw if str(item or "").strip()]
+    else:
+        urls = []
+    if urls:
+        return urls
+    if str(platform_name or "").strip().lower() == "chatgpt":
+        return [
+            "https://auth.openai.com/api/auth/csrf",
+            "https://chatgpt.com/",
+        ]
+    return ["https://httpbin.org/ip"]
+
+
+def _get_next_registration_proxy_from_pool(
+    proxy_pool_obj: Any,
+    *,
+    platform_name: str,
+    extra: dict[str, Any],
+    logger: "TaskLogger",
+) -> str | None:
+    region = str(
+        (extra or {}).get("registration_proxy_region")
+        or (extra or {}).get("proxy_region")
+        or ""
+    ).strip().upper()
+    max_attempts = max(_int_config((extra or {}).get("registration_proxy_max_retries"), 99), 1)
+    try:
+        return proxy_pool_obj.get_next(
+            region=region,
+            precheck=True,
+            max_attempts=max_attempts,
+            probe_urls=_registration_proxy_probe_urls(platform_name, extra),
+            log_fn=logger.log,
+        )
+    except TypeError:
+        return proxy_pool_obj.get_next(region=region)
+    except Exception as exc:
+        logger.log(f"代理池预筛选失败: {exc}", level="warning")
+        return None
+
+
 def _is_proxy_related_registration_error(error: str) -> bool:
     """注册失败是否应计入代理池失败统计。
 
@@ -1008,6 +1054,31 @@ def _is_proxy_related_registration_error(error: str) -> bool:
             "failed to fetch",
         )
     )
+
+
+_PRE_OTP_PROXY_RETRY_RESULT = "__pre_otp_proxy_retry__"
+
+_POST_OTP_REGISTRATION_ERROR_TOKENS = (
+    "获取验证码",
+    "等待验证码",
+    "验证验证码",
+    "未获取到验证码",
+    "验证码校验",
+    "验证码被判定无效",
+    "invalid code",
+    "otp callback",
+    "otp_callback",
+    "validate verification",
+    "verification failed",
+)
+
+
+def _is_pre_otp_proxy_registration_error(error: str) -> bool:
+    text = str(error or "").strip()
+    if not text or not _is_proxy_related_registration_error(text):
+        return False
+    lowered = text.lower()
+    return not any(token.lower() in lowered for token in _POST_OTP_REGISTRATION_ERROR_TOKENS)
 
 
 _LOCAL_MS_POOL_PROVIDER_NAMES = {"local_ms_pool", "local_ms"}
@@ -1449,6 +1520,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     # 当某线程触发 swap 但 extras 为空时置 set —— 整个任务级别立刻停止投新任务，
     # 让正在跑的任务自然失败结束，避免下一批又抢同一条死号继续被拒。
     sms_pool_exhausted = threading.Event()
+    registration_proxy_exhausted = threading.Event()
     if platform_name == "chatgpt" and _bool_config(
         extra.get("auto_chatgpt_plus_payment"), False
     ):
@@ -1523,6 +1595,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
     success = 0
     errors: list[str] = []
+    pre_otp_proxy_retries = 0
 
     # Pre-create a shared mailbox instance for the entire task to avoid
     # concurrent initialization issues (e.g. MoeMail auto-registering
@@ -1616,8 +1689,23 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             platform_name,
             explicit_proxy=proxy,
             use_proxy_pool=_registration_use_proxy_pool_for_platform(platform_name, extra),
-            proxy_getter=proxy_pool.get_next,
+            proxy_getter=lambda: _get_next_registration_proxy_from_pool(
+                proxy_pool,
+                platform_name=platform_name,
+                extra=extra,
+                logger=logger,
+            ),
         )
+        registration_uses_proxy_pool_for_attempt = _registration_use_proxy_pool_for_platform(platform_name, extra)
+        if (
+            platform_name == "chatgpt"
+            and registration_uses_proxy_pool_for_attempt
+            and not resolved_proxy
+            and not str(proxy or "").strip()
+        ):
+            registration_proxy_exhausted.set()
+            logger.log("代理池没有通过预检测的可用代理，本次不启动注册，且不计入注册失败", level="warning")
+            return _PRE_OTP_PROXY_RETRY_RESULT
         # 短链物理复用（CtfGptPlus / PayPal）：注册和打开短链必须同一浏览器。
         # 把 post_register 回调 + backend_config 注入 config.extra，让注册器在
         # 注册完、浏览器还开着时，在同一 page 上生成短链 → 跑 PayPal checkout。
@@ -1776,6 +1864,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             error = str(exc)
             if resolved_proxy and _is_proxy_related_registration_error(error):
                 proxy_pool.report_fail(resolved_proxy)
+            pre_otp_proxy_retry = bool(resolved_proxy) and account is None and _is_pre_otp_proxy_registration_error(error)
             if account is None:
                 _release_local_ms_pool_alias_after_registration_failure(
                     shared_mailbox=shared_mailbox,
@@ -1783,6 +1872,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     error=error,
                     logger=logger,
                 )
+            if pre_otp_proxy_retry:
+                logger.log(
+                    "OTP 邮件发送前发生代理/网络错误，本次不计入注册失败，"
+                    f"将换代理重试: {error}",
+                    level="warning",
+                )
+                return _PRE_OTP_PROXY_RETRY_RESULT
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)
@@ -1827,7 +1923,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
     try:
         submitted = 0
-        completed = 0
         futures: dict[Any, int] = {}
         # ChatGPT Plus 自动支付链接场景：用户诉求"设置生成 N 个必须生成 N 个
         # 成功"——失败的账号进入 gpt 账户池但**不增加进度**，调度继续投新任务
@@ -1837,12 +1932,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             platform_name == "chatgpt"
             and _bool_config(extra.get("auto_chatgpt_plus_payment"), False)
         )
+        registration_uses_proxy_pool = _registration_use_proxy_pool_for_platform(platform_name, extra)
         if chatgpt_plus_must_succeed:
             max_attempts = max(count * 5, count, 1)
         else:
             max_attempts = max(
                 count if not herosms_enabled else max_success * 3, 1
             )
+        if registration_uses_proxy_pool:
+            max_attempts = max(max_attempts, count * 99)
 
         def _hero_phone_alive() -> bool:
             if not (herosms_enabled and hero_reuse_to_max):
@@ -1869,6 +1967,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             # 继续被拒（用户实战日志 "开始注册第 2/1 个账号" 即此场景）。
             if sms_pool_exhausted.is_set():
                 return False
+            if registration_proxy_exhausted.is_set():
+                return False
             # 如果配了 sms_pool_slots，slot_queue 实际可用 + 在跑数 < 待补的
             # success 缺口才能再投。slot 全死光了（chatgpt_plus_must_succeed
             # 模式下号码池+备份池全被 PayPal 拒）就不再投，避免 _do_one 的
@@ -1882,7 +1982,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 # 已成功 + 在跑的 ≥ count 时不再投（避免超额）。
                 return success + len(futures) < count
             if not herosms_enabled:
-                return submitted < count
+                return success + len(errors) + len(futures) < count
             if success + len(futures) >= max_success:
                 return False
             if success < target_success:
@@ -1901,16 +2001,19 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 for future in done:
                     futures.pop(future, None)
                     result = future.result()
-                    completed += 1
                     if result is True:
                         success += 1
+                    elif result == _PRE_OTP_PROXY_RETRY_RESULT:
+                        pre_otp_proxy_retries += 1
                     elif result != "__cancel_requested__":
                         errors.append(str(result))
+                    if herosms_enabled or chatgpt_plus_must_succeed:
+                        progress_current = success
+                    else:
+                        progress_current = success + len(errors)
                     logger.set_progress(
                         min(
-                            success
-                            if (herosms_enabled or chatgpt_plus_must_succeed)
-                            else completed,
+                            progress_current,
                             progress_total,
                         ),
                         progress_total,
@@ -1935,9 +2038,17 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "hero_sms_reuse": True,
         })
     summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"
+    if pre_otp_proxy_retries:
+        summary += f", OTP前代理重试 {pre_otp_proxy_retries} 次"
     logger.log(summary, event_type="summary")
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+        return
+    if success == 0 and not errors and pre_otp_proxy_retries:
+        logger.finish(
+            TASK_STATUS_FAILED,
+            error=f"OTP 邮件发送前代理/网络失败，已重试 {pre_otp_proxy_retries} 次仍未注册成功",
+        )
         return
     final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
     final_error = "" if final_status == TASK_STATUS_SUCCEEDED else errors[0]

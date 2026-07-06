@@ -12,16 +12,11 @@ from .cpa_session import export_workspace_cpa_session_from_browser
 from .constants import CHATGPT_APP
 
 
-DEFAULT_WORKSPACE_IDS = "\n".join(
-    [
-        "631e1603-06cf-4f0b-b79b-d09fbfcfe98d",
-        "d1869eec-4d2d-4fce-967f-a1a6b906d51e",
-    ]
-)
+DEFAULT_WORKSPACE_IDS = ""
 
 
 def parse_workspace_ids(raw: Any) -> list[str]:
-    text = str(raw or "").strip() or DEFAULT_WORKSPACE_IDS
+    text = str(raw or "").strip()
     normalized = text.replace(",", "\n")
     return [item.strip() for item in normalized.splitlines() if item.strip()]
 

@@ -33,10 +33,7 @@ const BROWSER_MODE_OPTIONS = [
 ]
 
 const ACCOUNT_TOOL_BUTTON_CLASS = 'h-8 shrink-0 whitespace-nowrap bg-transparent'
-const DEFAULT_CHATGPT_WORKSPACE_IDS = [
-  '631e1603-06cf-4f0b-b79b-d09fbfcfe98d',
-  'd1869eec-4d2d-4fce-967f-a1a6b906d51e',
-].join('\n')
+const DEFAULT_CHATGPT_WORKSPACE_IDS = ''
 
 function getAccountOverview(acc: any) {
   return acc?.overview || {}
@@ -646,11 +643,11 @@ function RegisterModal({
                       <textarea
                         value={chatgptWorkspaceIds}
                         onChange={(e) => setChatgptWorkspaceIds(e.target.value)}
-                        placeholder={DEFAULT_CHATGPT_WORKSPACE_IDS}
+                        placeholder="可选：每行一个 Workspace ID"
                         className="control-surface control-surface-compact w-full min-h-20 font-mono text-xs"
                       />
                       <div className="mt-1 text-xs text-[var(--text-muted)]">
-                        注册完成后会在当前 ChatGPT 页面发送 Workspace Join Request，收到邀请邮件后自动打开邀请链接加入工作空间，并下载 CPA JSON 到本地。多 ID 可换行填写。此流程需要选择系统邮箱/邮箱注册，才能复用本地微软邮箱池收邀请邮件。
+                        留空时不加入 Workspace，仅导出 free 账号 CPA JSON；填写后注册完成会发送 Workspace Join Request，收到邀请邮件后自动打开邀请链接加入工作空间，并下载 CPA JSON 到本地。多 ID 可换行填写。Workspace Join 流程需要选择系统邮箱/邮箱注册，才能复用本地微软邮箱池收邀请邮件。
                       </div>
                     </div>
                   </div>
