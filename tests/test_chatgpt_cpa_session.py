@@ -71,8 +71,21 @@ def test_save_cpa_json_locally_writes_sanitized_json_file(tmp_path):
         now=datetime(2026, 7, 1, 1, 2, 3, tzinfo=timezone.utc),
     )
 
-    assert saved.name == "user-one-example-com_2026-07-01_01-02-03.json"
+    assert saved.name == "user-one-example-com.json"
     assert json.loads(saved.read_text(encoding="utf-8")) == cpa_json
+
+
+def test_save_cpa_json_locally_overwrites_same_email_file(tmp_path):
+    first = {"type": "codex", "email": "same@example.com", "access_token": "first"}
+    second = {"type": "codex", "email": "same@example.com", "access_token": "second"}
+
+    first_path = save_cpa_json_locally(first, output_dir=tmp_path)
+    second_path = save_cpa_json_locally(second, output_dir=tmp_path)
+
+    assert first_path == second_path
+    assert first_path.name == "same-example-com.json"
+    assert list(tmp_path.glob("same-example-com*.json")) == [first_path]
+    assert json.loads(second_path.read_text(encoding="utf-8")) == second
 
 
 def test_export_workspace_cpa_session_from_browser_switches_workspace_and_saves(tmp_path):
@@ -132,7 +145,7 @@ def test_export_workspace_cpa_session_from_browser_switches_workspace_and_saves(
     assert result["account_id"] == "workspace-account"
     assert result["email"] == "member@example.com"
     assert result["session_token"] == "workspace-session"
-    saved_path = tmp_path / "member-example-com_2026-07-01_01-02-03.json"
+    saved_path = tmp_path / "member-example-com.json"
     assert result["path"] == str(saved_path.resolve())
     assert json.loads(saved_path.read_text(encoding="utf-8"))["account_id"] == "workspace-account"
 

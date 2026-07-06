@@ -269,7 +269,7 @@ def test_auto_export_chatgpt_free_cpa_json_writes_local_file(tmp_path):
         output_dir=str(tmp_path),
     )
 
-    files = list(tmp_path.glob("free-example-com_*.json"))
+    files = list(tmp_path.glob("free-example-com.json"))
     assert len(files) == 1
     import json
 

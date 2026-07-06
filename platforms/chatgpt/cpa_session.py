@@ -255,14 +255,6 @@ def _sanitize_file_token(value: str, fallback: str = "chatgpt-session") -> str:
     return (base or fallback)[:80]
 
 
-def _timestamp_token(now: datetime | None = None) -> str:
-    dt = now or datetime.now(tz=timezone.utc)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%d_%H-%M-%S")
-
-
 def save_cpa_json_locally(
     cpa_json: dict[str, Any],
     *,
@@ -272,7 +264,7 @@ def save_cpa_json_locally(
 ) -> Path:
     target_dir = Path(output_dir) if output_dir is not None else Path("data") / "cpa_exports"
     target_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{_sanitize_file_token(email or str(cpa_json.get('email') or 'chatgpt-session'))}_{_timestamp_token(now)}.json"
+    filename = f"{_sanitize_file_token(email or str(cpa_json.get('email') or 'chatgpt-session'))}.json"
     path = target_dir / filename
     path.write_text(json.dumps(cpa_json, ensure_ascii=False, indent=2), encoding="utf-8")
     return path.resolve()

@@ -34,6 +34,8 @@ GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/mess
 DEFAULT_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read"
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms_mailbox_pool_state.json"
+MICROSOFT_PLUS_ALIAS_DOMAINS = {"outlook.com", "hotmail.com", "live.com", "msn.com"}
+MICROSOFT_PLUS_ALIAS_LIMIT = 5
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,17 @@ class LocalMicrosoftMailboxEntry:
         }
 
 
+@dataclass(frozen=True)
+class LocalMicrosoftMailboxAllocation:
+    entry: LocalMicrosoftMailboxEntry
+    email: str
+    alias_index: int = 0
+
+    @property
+    def key(self) -> str:
+        return self.email.strip().lower()
+
+
 def _truthy(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
@@ -121,6 +134,34 @@ def split_local_ms_pool_line(line: str) -> list[str]:
 
 def split_xinlan_common_line(line: str) -> list[str]:
     return split_local_ms_pool_line(line)
+
+
+def _split_email_address(value: str) -> tuple[str, str]:
+    text = str(value or "").strip().lower()
+    if "@" not in text:
+        return "", ""
+    local, domain = text.rsplit("@", 1)
+    return local, domain
+
+
+def _supports_microsoft_plus_alias(email: str) -> bool:
+    local, domain = _split_email_address(email)
+    return bool(local) and "+" not in local and domain in MICROSOFT_PLUS_ALIAS_DOMAINS
+
+
+def _microsoft_plus_alias(email: str, alias_index: int) -> str:
+    local, domain = _split_email_address(email)
+    if alias_index <= 0 or not _supports_microsoft_plus_alias(email):
+        return str(email or "").strip().lower()
+    return f"{local}+{alias_index}@{domain}"
+
+
+def _base_email_from_possible_alias(email: str) -> str:
+    local, domain = _split_email_address(email)
+    if not local or domain not in MICROSOFT_PLUS_ALIAS_DOMAINS:
+        return str(email or "").strip().lower()
+    base_local = local.split("+", 1)[0]
+    return f"{base_local}@{domain}"
 
 
 def _is_gujumpgate_hotmail_header(parts: list[str]) -> bool:
@@ -272,66 +313,91 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         material = f"{self.pool_file}\n{self.pool_text}".encode("utf-8")
         return hashlib.sha256(material).hexdigest()[:16]
 
-    def _reserve(self, entry: LocalMicrosoftMailboxEntry) -> None:
+    def _allocations_for_entry(self, entry: LocalMicrosoftMailboxEntry) -> list[LocalMicrosoftMailboxAllocation]:
+        limit = MICROSOFT_PLUS_ALIAS_LIMIT if _supports_microsoft_plus_alias(entry.email) else 1
+        return [
+            LocalMicrosoftMailboxAllocation(
+                entry=entry,
+                email=_microsoft_plus_alias(entry.email, index),
+                alias_index=index,
+            )
+            for index in range(limit)
+        ]
+
+    def _reserve(self, allocation: LocalMicrosoftMailboxAllocation) -> None:
         if self.allow_reuse:
             return
         state = self._state()
         used = dict(state.get("used") or {})
-        used[entry.key] = {
-            "email": entry.email,
+        used[allocation.key] = {
+            "email": allocation.email,
+            "base_email": allocation.entry.email,
+            "alias_index": allocation.alias_index,
             "reserved_at": datetime.now(timezone.utc).isoformat(),
             "source_id": self._source_id(),
         }
         state["used"] = used
         self._save_state(state)
 
-    def _available_entry(self) -> LocalMicrosoftMailboxEntry:
+    def _available_allocation(self) -> LocalMicrosoftMailboxAllocation:
         entries = self._entries()
         state = self._state()
-        used = set((state.get("used") or {}).keys())
+        used = {str(key or "").strip().lower() for key in (state.get("used") or {}).keys()}
         for entry in entries:
-            if self.allow_reuse or entry.key not in used:
-                return entry
-        raise RuntimeError(f"本地微软邮箱池已用尽: total={len(entries)}")
+            for allocation in self._allocations_for_entry(entry):
+                if self.allow_reuse or allocation.key not in used:
+                    return allocation
+        capacity = sum(len(self._allocations_for_entry(entry)) for entry in entries)
+        raise RuntimeError(f"本地微软邮箱池已用尽: total={len(entries)}, capacity={capacity}")
 
     def peek_email(self) -> str:
-        return self._available_entry().email
+        return self._available_allocation().email
 
     def get_email(self) -> MailboxAccount:
         with self._lock:
-            entry = self._available_entry()
-            self._reserve(entry)
+            allocation = self._available_allocation()
+            self._reserve(allocation)
 
+        entry = allocation.entry
         credentials = entry.credentials()
         credentials = {key: value for key, value in credentials.items() if value}
+        alias_metadata = {
+            "base_email": entry.email,
+            "alias_email": allocation.email,
+            "alias_index": allocation.alias_index,
+            "alias_limit": len(self._allocations_for_entry(entry)),
+            "plus_alias": allocation.alias_index > 0,
+        }
         return MailboxAccount(
-            email=entry.email,
-            account_id=entry.key,
+            email=allocation.email,
+            account_id=allocation.key,
             extra={
                 "provider_account": {
                     "provider_type": "mailbox",
                     "provider_name": "local_ms_pool",
                     "login_identifier": entry.login_account or entry.email,
-                    "display_name": entry.email,
+                    "display_name": allocation.email,
                     "credentials": credentials,
                     "metadata": {
                         "source": entry.source_format,
                         "source_format": entry.source_format,
                         "has_graph_refresh_token": bool(entry.graph_ready),
                         "has_imap_config": bool(entry.imap_ready),
+                        **alias_metadata,
                     },
                 },
                 "provider_resource": {
                     "provider_type": "mailbox",
                     "provider_name": "local_ms_pool",
                     "resource_type": "mailbox",
-                    "resource_identifier": entry.key,
-                    "handle": entry.email,
-                    "display_name": entry.email,
+                    "resource_identifier": allocation.key,
+                    "handle": allocation.email,
+                    "display_name": allocation.email,
                     "metadata": {
-                        "email": entry.email,
+                        "email": allocation.email,
                         "source": entry.source_format,
                         "reserved": not self.allow_reuse,
+                        **alias_metadata,
                     },
                 },
             },
@@ -344,10 +410,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         credentials = dict(provider_account.get("credentials") or {})
         metadata = dict(provider_account.get("metadata") or {})
         if credentials:
+            base_email = str(credentials.get("email") or account.email or "")
             return LocalMicrosoftMailboxEntry(
-                email=str(credentials.get("email") or account.email or ""),
+                email=base_email,
                 password=str(credentials.get("password") or ""),
-                login_account=str(credentials.get("login_account") or account.email or ""),
+                login_account=str(credentials.get("login_account") or base_email),
                 imap_host=str(credentials.get("imap_host") or ""),
                 imap_port=str(credentials.get("imap_port") or ""),
                 imap_account_type=str(credentials.get("imap_account_type") or ""),
@@ -360,8 +427,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 source_format=str(metadata.get("source") or metadata.get("source_format") or ""),
             )
 
+        base_account_email = _base_email_from_possible_alias(account_email)
         for entry in self._entries():
-            if entry.key == account_email:
+            if entry.key in {account_email, base_account_email}:
                 return entry
         raise RuntimeError(f"本地微软邮箱池未找到账号: {getattr(account, 'email', '')}")
 

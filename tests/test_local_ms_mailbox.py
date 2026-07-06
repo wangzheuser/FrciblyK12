@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from core.base_mailbox import MailboxAccount
 from core.local_ms_mailbox import LocalMicrosoftMailboxPool, parse_local_ms_pool_rows
 
@@ -38,6 +42,66 @@ def test_local_ms_pool_records_gujumpgate_source_metadata(tmp_path):
     assert provider_account["credentials"]["refresh_token"] == "refresh-token-456"
     assert provider_account["metadata"]["source"] == "gujumpgate_hotmail"
     assert provider_resource["metadata"]["source"] == "gujumpgate_hotmail"
+
+
+def test_local_ms_pool_expands_outlook_plus_alias_slots(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="yourname@outlook.com----mail-pass----client-id-123----refresh-token-456",
+        state_file=str(tmp_path / "state.json"),
+    )
+
+    accounts = [pool.get_email() for _ in range(5)]
+
+    assert [account.email for account in accounts] == [
+        "yourname@outlook.com",
+        "yourname+1@outlook.com",
+        "yourname+2@outlook.com",
+        "yourname+3@outlook.com",
+        "yourname+4@outlook.com",
+    ]
+    with pytest.raises(RuntimeError, match="capacity=5"):
+        pool.get_email()
+
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert set(state["used"]) == {account.email for account in accounts}
+    assert state["used"]["yourname+4@outlook.com"]["base_email"] == "yourname@outlook.com"
+    assert state["used"]["yourname+4@outlook.com"]["alias_index"] == 4
+
+
+def test_local_ms_pool_alias_account_keeps_base_credentials_for_graph(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="yourname@outlook.com----mail-pass----client-id-123----refresh-token-456",
+        state_file=str(tmp_path / "state.json"),
+    )
+    pool.get_email()
+
+    alias_account = pool.get_email()
+    provider_account = alias_account.extra["provider_account"]
+    provider_resource = alias_account.extra["provider_resource"]
+    entry = pool._entry_for_account(alias_account)
+
+    assert alias_account.email == "yourname+1@outlook.com"
+    assert provider_account["credentials"]["email"] == "yourname@outlook.com"
+    assert provider_account["credentials"]["login_account"] == "yourname@outlook.com"
+    assert provider_account["metadata"]["base_email"] == "yourname@outlook.com"
+    assert provider_account["metadata"]["alias_email"] == "yourname+1@outlook.com"
+    assert provider_account["metadata"]["alias_index"] == 1
+    assert provider_resource["handle"] == "yourname+1@outlook.com"
+    assert provider_resource["metadata"]["base_email"] == "yourname@outlook.com"
+    assert entry.email == "yourname@outlook.com"
+    assert entry.client_id == "client-id-123"
+    assert entry.refresh_token == "refresh-token-456"
+
+
+def test_local_ms_pool_does_not_expand_non_microsoft_domains(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="user@example.com----mail-pass----client-id-123----refresh-token-456",
+        state_file=str(tmp_path / "state.json"),
+    )
+
+    assert pool.get_email().email == "user@example.com"
+    with pytest.raises(RuntimeError, match="capacity=1"):
+        pool.get_email()
 
 
 def test_graph_access_token_tries_fallback_endpoint(monkeypatch):
