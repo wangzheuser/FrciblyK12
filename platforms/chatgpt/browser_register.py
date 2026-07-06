@@ -5077,16 +5077,17 @@ class ChatGPTBrowserRegister:
                 "registration_state": final_state,
             }
 
-            # 短链复用流程：注册拿到 session 后、**浏览器还开着**时，在同一个
-            # page 里继续打开短链 + 抓 midtrans_url。结果合并进返回值。
+            # 注册后续流程：注册拿到 session 后、**浏览器还开着**时，在同一个
+            # page 里继续执行 Workspace Join / Free CPA 导出 / 短链复用等流程。
+            # 结果合并进返回值。
             if callable(self.post_register_in_browser):
                 try:
-                    self.log("注册完成，浏览器保持打开，继续在同一浏览器里走短链付款流程…")
+                    self.log("注册完成，浏览器保持打开，继续执行浏览器内后续流程…")
                     extra = self.post_register_in_browser(page, dict(result))
                     if isinstance(extra, dict):
                         result.update(extra)
                 except Exception as exc:
-                    self.log(f"浏览器内短链后续流程异常（不影响注册结果）: {exc}")
+                    self.log(f"浏览器内后续流程异常（不影响注册结果）: {exc}")
             return result
 
     def _retry_oauth_fresh_browser(self, email, password):

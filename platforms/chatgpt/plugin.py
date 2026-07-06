@@ -279,9 +279,11 @@ class ChatGPTPlatform(BasePlatform):
                 "cookies": result.get("cookies", ""),
                 "profile": result.get("profile", {}),
                 "expires_at": result.get("expires_at", ""),
+                "session": result.get("session", {}),
                 # 短链物理复用：浏览器内 PayPal checkout 结果透传给上层任务判定。
                 "_shortlink_checkout": result.get("_shortlink_checkout", None),
                 "workspace_join": result.get("workspace_join", None),
+                "free_cpa_export": result.get("free_cpa_export", None),
             },
         )
 
@@ -309,8 +311,27 @@ class ChatGPTPlatform(BasePlatform):
             workspace_join_enabled,
         )
 
-        if not workspace_join_enabled(extra):
-            return downstream
+        workspace_enabled = workspace_join_enabled(extra)
+
+        def _public_cpa_export_result(export_result: dict) -> dict:
+            return {
+                key: value
+                for key, value in dict(export_result or {}).items()
+                if key not in {"access_token", "refresh_token", "id_token", "session_token"}
+            }
+
+        def _merge_token_updates(merged: dict, export_result: dict) -> None:
+            for source_key, target_key in (
+                ("access_token", "access_token"),
+                ("refresh_token", "refresh_token"),
+                ("id_token", "id_token"),
+                ("session_token", "session_token"),
+                ("account_id", "account_id"),
+                ("expired", "expires_at"),
+            ):
+                value = dict(export_result or {}).get(source_key)
+                if value not in (None, ""):
+                    merged[target_key] = value
 
         mailbox = getattr(self, "mailbox", None)
         mailbox_account = getattr(ctx.identity, "mailbox_account", None)
@@ -319,20 +340,39 @@ class ChatGPTPlatform(BasePlatform):
 
         def _post_register(page, session_info: dict) -> dict:
             merged: dict = {}
-            try:
-                log_fn("注册完成，开始在当前 ChatGPT 页面执行 Workspace Join Request")
-                workspace_result = run_workspace_join_flow(
-                    page,
-                    dict(session_info or {}),
-                    mailbox=mailbox,
-                    mailbox_account=mailbox_account,
-                    config=cfg,
-                    log=log_fn,
-                )
-                merged.update(workspace_result)
-            except Exception as exc:
-                log_fn(f"Workspace Join 后续流程异常（不影响账号注册结果）: {exc}")
-                merged["workspace_join"] = {"ok": False, "error": str(exc)}
+            if workspace_enabled:
+                try:
+                    log_fn("注册完成，开始在当前 ChatGPT 页面执行 Workspace Join Request")
+                    workspace_result = run_workspace_join_flow(
+                        page,
+                        dict(session_info or {}),
+                        mailbox=mailbox,
+                        mailbox_account=mailbox_account,
+                        config=cfg,
+                        log=log_fn,
+                    )
+                    merged.update(workspace_result)
+                except Exception as exc:
+                    log_fn(f"Workspace Join 后续流程异常（不影响账号注册结果）: {exc}")
+                    merged["workspace_join"] = {"ok": False, "error": str(exc)}
+            else:
+                try:
+                    from platforms.chatgpt.cpa_session import export_workspace_cpa_session_from_browser
+
+                    log_fn("注册完成，开始导出 Free CPA JSON")
+                    export_result = export_workspace_cpa_session_from_browser(
+                        page,
+                        workspace_id="",
+                        output_dir=None,
+                        log=log_fn,
+                    )
+                    if not isinstance(export_result, dict) or not export_result.get("ok"):
+                        raise RuntimeError(f"unexpected export result: {export_result}")
+                    merged["free_cpa_export"] = _public_cpa_export_result(export_result)
+                    _merge_token_updates(merged, export_result)
+                except Exception as exc:
+                    log_fn(f"Free CPA JSON 导出失败（不影响注册结果）: {exc}")
+                    merged["free_cpa_export"] = {"ok": False, "error": str(exc)}
 
             if callable(downstream):
                 try:

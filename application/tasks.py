@@ -640,6 +640,78 @@ def _auto_upload_cpa(task_logger: TaskLogger, account) -> None:
         task_logger.log(f"  [CPA] 自动上传异常: {exc}", level="warning")
 
 
+def _auto_export_chatgpt_free_cpa_json(
+    task_logger: TaskLogger,
+    account,
+    *,
+    output_dir: str | None = None,
+) -> None:
+    """注册成功后自动落盘 ChatGPT Free CPA JSON（不影响注册成功状态）。"""
+    if getattr(account, "platform", "") != "chatgpt":
+        return
+
+    extra = getattr(account, "extra", None) or {}
+    if not isinstance(extra, dict):
+        extra = {}
+
+    # Workspace Join 场景会导出 workspace CPA JSON；浏览器注册场景若已经在
+    # post_register_in_browser 中导出 Free CPA，也不要重复落盘。
+    workspace_join = extra.get("workspace_join")
+    if isinstance(workspace_join, dict):
+        return
+    free_cpa_export = extra.get("free_cpa_export")
+    if isinstance(free_cpa_export, dict) and free_cpa_export.get("ok"):
+        return
+
+    try:
+        from platforms.chatgpt.cpa_session import (
+            convert_chatgpt_session_to_cpa_json,
+            save_cpa_json_locally,
+        )
+
+        session_payload = dict(extra.get("session") or {}) if isinstance(extra.get("session"), dict) else {}
+        access_token = str(extra.get("access_token") or getattr(account, "token", "") or "").strip()
+        if not access_token:
+            task_logger.log("  [CPA] 跳过 Free CPA JSON 导出: 缺少 access_token", level="warning")
+            return
+
+        defaults = {
+            "accessToken": access_token,
+            "refreshToken": str(extra.get("refresh_token") or "").strip(),
+            "idToken": str(extra.get("id_token") or "").strip(),
+            "sessionToken": str(extra.get("session_token") or "").strip(),
+            "account_id": str(
+                getattr(account, "user_id", "")
+                or extra.get("account_id")
+                or extra.get("chatgpt_account_id")
+                or ""
+            ).strip(),
+            "email": str(getattr(account, "email", "") or "").strip(),
+            "expires": str(extra.get("expires_at") or "").strip(),
+        }
+        for key, value in defaults.items():
+            if value and not session_payload.get(key):
+                session_payload[key] = value
+
+        user = session_payload.get("user")
+        if not isinstance(user, dict):
+            user = {}
+        if defaults["email"] and not user.get("email"):
+            user["email"] = defaults["email"]
+        if user:
+            session_payload["user"] = user
+
+        cpa_json = convert_chatgpt_session_to_cpa_json(session_payload)
+        path = save_cpa_json_locally(
+            cpa_json,
+            email=str(cpa_json.get("email") or getattr(account, "email", "") or ""),
+            output_dir=output_dir,
+        )
+        task_logger.log(f"  [CPA] Free CPA JSON saved to {path}")
+    except Exception as exc:
+        task_logger.log(f"  [CPA] Free CPA JSON 导出异常（不影响注册结果）: {exc}", level="warning")
+
+
 def _chatgpt_workspace_join_failure(account) -> str:
     if getattr(account, "platform", "") != "chatgpt":
         return ""
@@ -1540,6 +1612,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.record_success()
             logger.log(f"✓ 注册成功: {account.email}")
             _save_task_log(platform_name, account.email, "success")
+            _auto_export_chatgpt_free_cpa_json(logger, account)
             _auto_upload_cpa(logger, account)
             _auto_push_any2api(logger, account)
             account_extra = dict(account.extra or {})

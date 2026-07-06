@@ -77,6 +77,8 @@ def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
 
 
 def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatch):
+    captured = {}
+
     class FakePlatform:
         def register(self, email=None, password=None):
             return Account(
@@ -100,6 +102,11 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
     )
     monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
     monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        tasks_module,
+        "_auto_export_chatgpt_free_cpa_json",
+        lambda _logger, account: captured.setdefault("free_cpa_email", account.email),
+    )
 
     logger = _FakeLogger()
 
@@ -119,6 +126,7 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
     )
 
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert captured["free_cpa_email"] == "registered@example.com"
     assert any(event[0] == "success" for event in logger.events)
     assert not any(
         "cannot access local variable 'extra'" in str(event)
@@ -157,6 +165,7 @@ def test_chatgpt_register_task_fails_when_workspace_join_fails(monkeypatch):
     )
     monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
     monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_export_chatgpt_free_cpa_json", lambda *args, **kwargs: None)
 
     logger = _FakeLogger()
 
@@ -204,6 +213,7 @@ def test_chatgpt_register_task_uses_proxy_pool_when_requested(monkeypatch):
     monkeypatch.setattr(tasks_module, "_build_platform_instance", fake_build_platform)
     monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
     monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_export_chatgpt_free_cpa_json", lambda *args, **kwargs: None)
 
     from core.proxy_pool import proxy_pool
 
@@ -234,6 +244,95 @@ def test_chatgpt_register_task_uses_proxy_pool_when_requested(monkeypatch):
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
     assert any(
         event[0] == "log" and "使用代理: http://pool-proxy.example:8080" in event[1]
+        for event in logger.events
+    )
+
+
+def test_auto_export_chatgpt_free_cpa_json_writes_local_file(tmp_path):
+    account = Account(
+        platform="chatgpt",
+        email="free@example.com",
+        password="Secret123!",
+        user_id="acct_free",
+        token="access-token",
+        extra={
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "session_token": "session-token",
+        },
+    )
+    logger = _FakeLogger()
+
+    tasks_module._auto_export_chatgpt_free_cpa_json(
+        logger,
+        account,
+        output_dir=str(tmp_path),
+    )
+
+    files = list(tmp_path.glob("free-example-com_*.json"))
+    assert len(files) == 1
+    import json
+
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["type"] == "codex"
+    assert payload["account_id"] == "acct_free"
+    assert payload["email"] == "free@example.com"
+    assert payload["access_token"] == "access-token"
+    assert payload["refresh_token"] == "refresh-token"
+    assert payload["session_token"] == "session-token"
+    assert any("Free CPA JSON saved" in event[1] for event in logger.events)
+
+
+def test_auto_export_chatgpt_free_cpa_json_skips_workspace_join(tmp_path):
+    account = Account(
+        platform="chatgpt",
+        email="workspace@example.com",
+        password="Secret123!",
+        user_id="acct_workspace",
+        extra={
+            "access_token": "access-token",
+            "workspace_join": {"ok": True},
+        },
+    )
+    logger = _FakeLogger()
+
+    tasks_module._auto_export_chatgpt_free_cpa_json(
+        logger,
+        account,
+        output_dir=str(tmp_path),
+    )
+
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_auto_export_chatgpt_free_cpa_json_failure_is_warning(monkeypatch, tmp_path):
+    from platforms.chatgpt import cpa_session
+
+    account = Account(
+        platform="chatgpt",
+        email="free@example.com",
+        password="Secret123!",
+        user_id="acct_free",
+        extra={"access_token": "access-token"},
+    )
+    monkeypatch.setattr(
+        cpa_session,
+        "convert_chatgpt_session_to_cpa_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    logger = _FakeLogger()
+
+    tasks_module._auto_export_chatgpt_free_cpa_json(
+        logger,
+        account,
+        output_dir=str(tmp_path),
+    )
+
+    assert list(tmp_path.glob("*.json")) == []
+    assert any(
+        event[0] == "log"
+        and event[2].get("level") == "warning"
+        and "Free CPA JSON 导出异常" in event[1]
         for event in logger.events
     )
 
