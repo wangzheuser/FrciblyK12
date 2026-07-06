@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 from application import tasks as tasks_module
 from core.base_platform import Account
 from domain.actions import ActionExecutionResult
@@ -40,6 +43,41 @@ class _FakeLogger:
 
     def finish(self, status, *, error=""):
         self.finished = (status, error)
+
+
+def _patch_local_ms_register_task(monkeypatch, pool):
+    from core import base_mailbox as base_mailbox_module
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(base_mailbox_module, "create_mailbox", lambda *args, **kwargs: pool)
+    monkeypatch.setattr(tasks_module, "save_account", lambda account: account)
+    monkeypatch.setattr(tasks_module, "_save_task_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_mark_outlook_mailbox_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_export_chatgpt_free_cpa_json", lambda *args, **kwargs: None)
+
+
+def _local_ms_payload(pool_text: str, state_file: str, **extra_overrides):
+    extra = {
+        "identity_provider": "mailbox",
+        "mail_provider": "local_ms_pool",
+        "local_ms_pool_text": pool_text,
+        "local_ms_pool_state_file": state_file,
+        "auto_chatgpt_plus_payment": False,
+    }
+    extra.update(extra_overrides)
+    return {
+        "platform": "chatgpt",
+        "count": 1,
+        "concurrency": 1,
+        "extra": extra,
+    }
 
 
 def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
@@ -246,6 +284,180 @@ def test_chatgpt_register_task_uses_proxy_pool_when_requested(monkeypatch):
         event[0] == "log" and "使用代理: http://pool-proxy.example:8080" in event[1]
         for event in logger.events
     )
+
+
+def test_register_task_releases_local_ms_alias_after_retryable_registration_error(monkeypatch, tmp_path):
+    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+
+    pool_text = "yourname@outlook.com----mail-pass----client-id-123----refresh-token-456"
+    state_file = str(tmp_path / "state.json")
+    pool = LocalMicrosoftMailboxPool(pool_text=pool_text, state_file=state_file)
+    _patch_local_ms_register_task(monkeypatch, pool)
+
+    class FakePlatform:
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
+            self._last_identity = None
+
+        def register(self, email=None, password=None):
+            mailbox_account = self.mailbox.get_email()
+            self._last_identity = SimpleNamespace(mailbox_account=mailbox_account)
+            raise RuntimeError("proxy timeout while loading signup page")
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(kwargs["shared_mailbox"]),
+    )
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(_local_ms_payload(pool_text, state_file), logger)
+
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["used"] == {}
+    assert logger.finished == (
+        tasks_module.TASK_STATUS_FAILED,
+        "proxy timeout while loading signup page",
+    )
+    assert any(event[0] == "log" and "local_ms_pool alias 已释放" in event[1] for event in logger.events)
+
+
+def test_register_task_keeps_local_ms_alias_after_non_retryable_registration_error(monkeypatch, tmp_path):
+    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+
+    pool_text = "yourname@outlook.com----mail-pass----client-id-123----refresh-token-456"
+    state_file = str(tmp_path / "state.json")
+    pool = LocalMicrosoftMailboxPool(pool_text=pool_text, state_file=state_file)
+    _patch_local_ms_register_task(monkeypatch, pool)
+
+    class FakePlatform:
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
+            self._last_identity = None
+
+        def register(self, email=None, password=None):
+            mailbox_account = self.mailbox.get_email()
+            self._last_identity = SimpleNamespace(mailbox_account=mailbox_account)
+            raise RuntimeError("email already registered")
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(kwargs["shared_mailbox"]),
+    )
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(_local_ms_payload(pool_text, state_file), logger)
+
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert set(state["used"]) == {"yourname@outlook.com"}
+    assert logger.finished == (
+        tasks_module.TASK_STATUS_FAILED,
+        "email already registered",
+    )
+    assert not any(event[0] == "log" and "local_ms_pool alias 已释放" in event[1] for event in logger.events)
+
+
+def test_register_task_keeps_local_ms_alias_when_workspace_join_fails_after_registration(monkeypatch, tmp_path):
+    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+
+    pool_text = "yourname@outlook.com----mail-pass----client-id-123----refresh-token-456"
+    state_file = str(tmp_path / "state.json")
+    pool = LocalMicrosoftMailboxPool(pool_text=pool_text, state_file=state_file)
+    _patch_local_ms_register_task(monkeypatch, pool)
+
+    class FakePlatform:
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
+            self._last_identity = None
+
+        def register(self, email=None, password=None):
+            mailbox_account = self.mailbox.get_email()
+            self._last_identity = SimpleNamespace(mailbox_account=mailbox_account)
+            return Account(
+                platform="chatgpt",
+                email=mailbox_account.email,
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={
+                    "access_token": "access-token",
+                    "workspace_join": {
+                        "ok": False,
+                        "error": "invite button not clicked",
+                    },
+                },
+            )
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(kwargs["shared_mailbox"]),
+    )
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        _local_ms_payload(pool_text, state_file, auto_chatgpt_workspace_join=True),
+        logger,
+    )
+
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert set(state["used"]) == {"yourname@outlook.com"}
+    assert logger.finished == (
+        tasks_module.TASK_STATUS_FAILED,
+        "Workspace Join 失败: invite button not clicked",
+    )
+    assert not any(event[0] == "log" and "local_ms_pool alias 已释放" in event[1] for event in logger.events)
+
+
+def test_register_task_keeps_local_ms_alias_when_plus_followup_fails_after_registration(monkeypatch, tmp_path):
+    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+
+    pool_text = "yourname@outlook.com----mail-pass----client-id-123----refresh-token-456"
+    state_file = str(tmp_path / "state.json")
+    pool = LocalMicrosoftMailboxPool(pool_text=pool_text, state_file=state_file)
+    _patch_local_ms_register_task(monkeypatch, pool)
+    monkeypatch.setattr(
+        tasks_module,
+        "_auto_followup_chatgpt_plus_payment",
+        lambda *args, **kwargs: "ChatGPT Plus 支付链接生成失败: checkout timeout",
+    )
+
+    class FakePlatform:
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
+            self._last_identity = None
+
+        def register(self, email=None, password=None):
+            mailbox_account = self.mailbox.get_email()
+            self._last_identity = SimpleNamespace(mailbox_account=mailbox_account)
+            return Account(
+                platform="chatgpt",
+                email=mailbox_account.email,
+                password=password or "Secret123!",
+                user_id=f"acct_{mailbox_account.email}",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(kwargs["shared_mailbox"]),
+    )
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        _local_ms_payload(pool_text, state_file, auto_chatgpt_plus_payment=True),
+        logger,
+    )
+
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert "yourname@outlook.com" in state["used"]
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert not any(event[0] == "log" and "local_ms_pool alias 已释放" in event[1] for event in logger.events)
 
 
 def test_auto_export_chatgpt_free_cpa_json_writes_local_file(tmp_path):

@@ -68,6 +68,42 @@ def test_local_ms_pool_expands_outlook_plus_alias_slots(tmp_path):
     assert state["used"]["yourname+4@outlook.com"]["alias_index"] == 4
 
 
+def test_local_ms_pool_release_alias_allows_retry(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="yourname@outlook.com----mail-pass----client-id-123----refresh-token-456",
+        state_file=str(tmp_path / "state.json"),
+    )
+
+    account = pool.get_email()
+
+    assert account.email == "yourname@outlook.com"
+    assert pool.release_email(account, reason="proxy timeout") is True
+    assert pool.get_email().email == "yourname@outlook.com"
+
+
+def test_local_ms_pool_release_ignores_other_providers(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="yourname@outlook.com----mail-pass----client-id-123----refresh-token-456",
+        state_file=str(tmp_path / "state.json"),
+    )
+    reserved = pool.get_email()
+    other = MailboxAccount(
+        email="other@example.com",
+        account_id="other@example.com",
+        extra={
+            "provider_resource": {
+                "provider_name": "other_provider",
+                "resource_identifier": reserved.account_id,
+            }
+        },
+    )
+
+    assert pool.release_email(other, reason="proxy timeout") is False
+
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert set(state["used"]) == {reserved.email}
+
+
 def test_local_ms_pool_alias_account_keeps_base_credentials_for_graph(tmp_path):
     pool = LocalMicrosoftMailboxPool(
         pool_text="yourname@outlook.com----mail-pass----client-id-123----refresh-token-456",

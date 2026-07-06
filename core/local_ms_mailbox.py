@@ -403,6 +403,53 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             },
         )
 
+    @staticmethod
+    def _state_key_for_account(account: MailboxAccount) -> str:
+        extra = dict(getattr(account, "extra", {}) or {})
+        provider_account = dict(extra.get("provider_account") or {})
+        provider_resource = dict(extra.get("provider_resource") or {})
+        provider_names = {
+            str(extra.get("mailbox_provider_key") or "").strip().lower(),
+            str(provider_account.get("provider_name") or provider_account.get("provider") or "").strip().lower(),
+            str(provider_resource.get("provider_name") or provider_resource.get("provider") or "").strip().lower(),
+        }
+        provider_names.discard("")
+        if provider_names and not provider_names.intersection({"local_ms_pool", "local_ms"}):
+            return ""
+
+        account_metadata = dict(provider_account.get("metadata") or {})
+        resource_metadata = dict(provider_resource.get("metadata") or {})
+        candidates = [
+            getattr(account, "account_id", ""),
+            provider_resource.get("resource_identifier"),
+            provider_resource.get("handle"),
+            resource_metadata.get("alias_email"),
+            resource_metadata.get("email"),
+            account_metadata.get("alias_email"),
+            getattr(account, "email", ""),
+        ]
+        for value in candidates:
+            key = str(value or "").strip().lower()
+            if key:
+                return key
+        return ""
+
+    def release_email(self, account: MailboxAccount, reason: str = "") -> bool:
+        if self.allow_reuse:
+            return False
+        key = self._state_key_for_account(account)
+        if not key:
+            return False
+        with self._lock:
+            state = self._state()
+            used = dict(state.get("used") or {})
+            if key not in used:
+                return False
+            used.pop(key, None)
+            state["used"] = used
+            self._save_state(state)
+        return True
+
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:
         account_email = str(getattr(account, "email", "") or "").strip().lower()
         extra = dict(getattr(account, "extra", {}) or {})

@@ -1010,6 +1010,154 @@ def _is_proxy_related_registration_error(error: str) -> bool:
     )
 
 
+_LOCAL_MS_POOL_PROVIDER_NAMES = {"local_ms_pool", "local_ms"}
+
+_LOCAL_MS_ALIAS_NON_RETRYABLE_ERROR_TOKENS = (
+    "already registered",
+    "already exists",
+    "account exists",
+    "user exists",
+    "user_exists",
+    "email_already_registered",
+    "email already",
+    "email unavailable",
+    "invalid email",
+    "doesn't look right",
+    "邮箱已注册",
+    "已经注册",
+    "已注册过",
+    "已在 openai 注册",
+    "账号已存在",
+    "账户已存在",
+    "邮箱不可用",
+    "邮箱无效",
+    "邮箱格式",
+)
+
+_LOCAL_MS_ALIAS_RETRYABLE_ERROR_TOKENS = (
+    "proxy",
+    "network",
+    "connection",
+    "connect",
+    "timeout",
+    "timed out",
+    "ns_error_net",
+    "err_",
+    "tunnel",
+    "socks",
+    "tls",
+    "ssl",
+    "name_not_resolved",
+    "address_unreachable",
+    "failed to fetch",
+    "browser",
+    "playwright",
+    "target page",
+    "context or browser has been closed",
+    "browser has been closed",
+    "page crashed",
+    "execution context was destroyed",
+    "net::",
+    "captcha",
+    "turnstile",
+    "otp",
+    "verification code",
+    "email-verification",
+    "验证码",
+    "验证码页",
+    "获取验证码失败",
+    "发送验证码失败",
+    "验证验证码失败",
+    "验证码校验失败",
+    "未获取到验证码",
+    "未跳转",
+    "未进入",
+    "未找到",
+    "页面",
+    "page",
+    "风控",
+    "risk",
+    "temporarily",
+    "temporary",
+    "try again",
+    "too many",
+    "rate limit",
+    "oops",
+    "sorry, we cannot create your account",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "http 5",
+)
+
+
+def _mailbox_account_provider_names(mailbox_account: Any) -> set[str]:
+    extra = dict(getattr(mailbox_account, "extra", {}) or {})
+    provider_account = dict(extra.get("provider_account") or {})
+    provider_resource = dict(extra.get("provider_resource") or {})
+    names = {
+        str(extra.get("mailbox_provider_key") or "").strip().lower(),
+        str(provider_account.get("provider_name") or provider_account.get("provider") or "").strip().lower(),
+        str(provider_resource.get("provider_name") or provider_resource.get("provider") or "").strip().lower(),
+    }
+    names.discard("")
+    return names
+
+
+def _is_local_ms_pool_mailbox_account(mailbox_account: Any) -> bool:
+    return bool(_mailbox_account_provider_names(mailbox_account).intersection(_LOCAL_MS_POOL_PROVIDER_NAMES))
+
+
+def _should_release_local_ms_pool_alias_after_registration_error(error: str) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    if any(token in text for token in _LOCAL_MS_ALIAS_NON_RETRYABLE_ERROR_TOKENS):
+        return False
+    if _is_proxy_related_registration_error(text):
+        return True
+    return any(token in text for token in _LOCAL_MS_ALIAS_RETRYABLE_ERROR_TOKENS)
+
+
+def _release_local_ms_pool_alias_after_registration_failure(
+    *,
+    shared_mailbox: Any,
+    platform: Any,
+    error: str,
+    logger: "TaskLogger",
+) -> None:
+    if not _should_release_local_ms_pool_alias_after_registration_error(error):
+        return
+    identity = getattr(platform, "_last_identity", None)
+    mailbox_account = getattr(identity, "mailbox_account", None)
+    if mailbox_account is None or not _is_local_ms_pool_mailbox_account(mailbox_account):
+        return
+    if shared_mailbox is None:
+        return
+
+    releaser = getattr(shared_mailbox, "release_email", None)
+    if not callable(releaser):
+        resolver = getattr(shared_mailbox, "_resolve_mailbox", None)
+        if callable(resolver):
+            try:
+                resolved_mailbox = resolver(mailbox_account)
+                releaser = getattr(resolved_mailbox, "release_email", None)
+            except Exception:
+                releaser = None
+    if not callable(releaser):
+        return
+
+    alias_email = str(getattr(mailbox_account, "email", "") or getattr(mailbox_account, "account_id", "") or "").strip()
+    try:
+        released = bool(releaser(mailbox_account, reason=error))
+    except Exception as exc:
+        logger.log(f"local_ms_pool alias 释放失败（忽略）: {exc}", level="warning")
+        return
+    if released:
+        suffix = f": {alias_email}" if alias_email else ""
+        logger.log(f"local_ms_pool alias 已释放，后续可重试{suffix}，原因: {str(error or '')[:200]}")
+
+
 def _auto_followup_windsurf_payment(
     *,
     platform_name: str,
@@ -1533,6 +1681,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         logger.log("Workspace Join 需要复用当前 ChatGPT 页面，已将本次注册执行器从 protocol 切换为 headed")
             except Exception as exc:
                 logger.log(f"Workspace Join 配置检查失败，继续原注册流程: {exc}", level="error")
+        platform = None
+        account = None
         try:
             platform = _build_platform_instance(platform_name, _build_payload, logger, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
             # 失败不计进度的模式（chatgpt_plus_must_succeed）下 index 可能 > count，
@@ -1626,6 +1776,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             error = str(exc)
             if resolved_proxy and _is_proxy_related_registration_error(error):
                 proxy_pool.report_fail(resolved_proxy)
+            if account is None:
+                _release_local_ms_pool_alias_after_registration_failure(
+                    shared_mailbox=shared_mailbox,
+                    platform=platform,
+                    error=error,
+                    logger=logger,
+                )
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)

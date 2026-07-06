@@ -116,6 +116,16 @@ class FallbackMailbox(BaseMailbox):
             before_ids=before_ids,
         )
 
+    def release_email(self, account: MailboxAccount, reason: str = "") -> bool:
+        try:
+            mailbox = self._resolve_mailbox(account)
+        except Exception:
+            return False
+        releaser = getattr(mailbox, "release_email", None)
+        if not callable(releaser):
+            return False
+        return bool(releaser(account, reason=reason))
+
 
 def _extract_verification_link(text: str, keyword: str = "") -> str | None:
     combined = str(text or "")
